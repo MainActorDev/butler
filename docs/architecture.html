@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Butler — Architecture &amp; Flow</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --purple: #bc8cff;
+    --orange: #d29922;
+    --red: #f85149;
+    --teal: #39c5cf;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 32px;
+    min-width: 980px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 28px; }
+  h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin: 26px 0 12px; }
+
+  .layer { display: flex; gap: 14px; align-items: stretch; }
+  .layer + .layer { margin-top: 0; }
+
+  .box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    flex: 1;
+    min-width: 0;
+  }
+  .box b { display: block; font-size: 12.5px; margin-bottom: 2px; }
+  .box .files { color: var(--muted); font-size: 10.5px; }
+  .box.blue    b { color: var(--blue); }
+  .box.green   b { color: var(--green); }
+  .box.purple  b { color: var(--purple); }
+  .box.orange  b { color: var(--orange); }
+  .box.teal    b { color: var(--teal); }
+  .box.red     b { color: var(--red); }
+
+  .consumer { border-style: dashed; border-color: #6e7681; }
+  .consumer b { color: #c9d1d9 !important; }
+
+  .arrow-row { display: flex; justify-content: center; gap: 180px; padding: 6px 0; }
+  .arrow { color: var(--muted); font-size: 15px; }
+  .arrow small { display: block; font-size: 10px; color: #6e7681; text-align: center; }
+
+  .flow {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    font-size: 12px;
+    line-height: 2.1;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .flow .step { color: var(--text); }
+  .flow .n { color: var(--orange); }
+  .flow .core { color: var(--purple); }
+  .flow .data { color: var(--green); }
+  .flow .gate { color: var(--red); }
+  .flow .prov { color: var(--blue); }
+  .flow .doc  { color: var(--teal); }
+  .flow .ans  { color: var(--green); font-weight: bold; }
+  .flow .note { color: var(--muted); }
+
+  .legend { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 11px; color: var(--muted); }
+  .legend span::before { content: "■ "; }
+  .l-blue::before { color: var(--blue); }
+  .l-green::before { color: var(--green); }
+  .l-purple::before { color: var(--purple); }
+  .l-orange::before { color: var(--orange); }
+  .l-red::before { color: var(--red); }
+  .l-teal::before { color: var(--teal); }
+</style>
+</head>
+<body>
+  <h1>Butler — Architecture &amp; Flow</h1>
+  <div class="sub">@mainactordev/butler · a reusable agent runtime · consumers bring tools, sources, policy — Butler brings the loop</div>
+
+  <h2>Layers (top = what consumers see, bottom = what Butler owns)</h2>
+  <div class="layer">
+    <div class="box consumer">
+      <b>Consumer app — e.g. demo/, (later) Lionidas</b>
+      <span class="files">registers tools + validator-as-ground-truth · picks policy (DRAFT) · wires sources · owns the sqlite file · provides auth + WS bus</span>
+    </div>
+  </div>
+  <div class="arrow-row"><span class="arrow">▼<small>imports butler · dependency points ONE way</small></span><span class="arrow">▲<small>tools/policy/storage/events injected in</small></span></div>
+
+  <div class="layer">
+    <div class="box blue">
+      <b>Transports</b>
+      <span class="files">transport/conversation.ts — Fastify: POST/GET /api/agent/sessions, POST messages<br>transport/mcp.ts — official SDK, stateless streamable-HTTP /mcp<br>turn events → consumer's WebSocket (butler.* types, no SSE)</span>
+    </div>
+    <div class="box orange">
+      <b>Eval harness</b>
+      <span class="files">eval.ts — retrieval top-k · budget caps · authoring (validator-as-judge)<br>canary: wrong expectation fails ON the metric — CI can go red</span>
+    </div>
+  </div>
+
+  <div class="arrow-row"><span class="arrow">▼</span></div>
+
+  <div class="layer">
+    <div class="box purple">
+      <b>Loop — reason → act → observe</b>
+      <span class="files">loop.ts · budgets: hops / tokens / WALL (loop owns the clock — hanging providers are aborted at deadline) · tool throws become observations (ReAct) · one repair round for bad JSON · partial transcript rides every error (resumable)</span>
+    </div>
+    <div class="box red">
+      <b>Tools + Policy</b>
+      <span class="files">tools.ts · ToolRegistry: name → schema + handler + permission (read &lt; draft &lt; act)<br>refusals are TYPED and name the tool + policy<br>act tools exist but are invisible/refused under DRAFT</span>
+    </div>
+    <div class="box teal">
+      <b>Provider</b>
+      <span class="files">provider/openai-compat.ts — plain fetch, any OpenAI-compatible base<br>retries 429/5xx capped by remaining wall · per-call timeout<br>provider/mock.ts — deterministic turns + hang simulation</span>
+    </div>
+  </div>
+
+  <div class="arrow-row"><span class="arrow">▼</span></div>
+
+  <div class="layer">
+    <div class="box green">
+      <b>Memory + Storage</b>
+      <span class="files">memory/sqlite.ts — six butler_* tables, guarded idempotent migrations, WAL<br>sessions (parent/depth = orchestration seam) · messages · notes (provenance MANDATORY, supersede-never-delete) · sources · documents · chunks</span>
+    </div>
+    <div class="box green">
+      <b>Retrieval</b>
+      <span class="files">memory/retrieval.ts — pure-TS okapi BM25 over chunks + notes<br>BEIR-first: embeddings deferred until SQL+notes demonstrably fail</span>
+    </div>
+    <div class="box green">
+      <b>Sources + Ingestion</b>
+      <span class="files">sources/ — file · jira · github · repo connectors<br>ingest(): sha256 content-addressed, cache-first · caps 2MB/10k-chunks · binaries → artifacts dir, never the DB<br>chunk.ts: structural (headings / diff files / ticket fields)</span>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span class="l-purple">loop</span><span class="l-red">gates</span><span class="l-teal">model I/O</span>
+    <span class="l-green">memory/data</span><span class="l-blue">surfaces</span><span class="l-orange">evals</span>
+  </div>
+
+  <h2>The authoring flow (live-proven: glm-5.3-flash, condition 3)</h2>
+  <div class="flow"><span class="step"><span class="n">1.</span> user message → conversation API (or MCP tools/call — same registry)</span>
+<span class="step"><span class="n">2.</span> session resumed from rows alone <span class="data">(butler_messages replay)</span></span>
+<span class="step"><span class="n">3.</span> <span class="core">loop</span> assembles context → <span class="prov">provider</span> call (budgets: wall clock owns everything)</span>
+<span class="step"><span class="n">4.</span> model asks <span class="doc">docs.search</span> → BM25 over ingested chunks → top-k observations</span>
+<span class="step"><span class="n">5.</span> model asks <span class="doc">docs.get</span> → full ticket fixture by sha256 (provenance: it cites hashes)</span>
+<span class="step"><span class="n">6.</span> model calls spec.draft  <span class="gate">→ validator: INVALID</span>   <span class="note">external signal, not self-critique</span></span>
+<span class="step"><span class="n">7.</span> model repairs draft     <span class="gate">→ validator: INVALID</span>   <span class="note">(observed twice in the live drill)</span></span>
+<span class="step"><span class="n">8.</span> model repairs again     <span class="gate">→ validator: VALID ✓</span></span>
+<span class="step"><span class="n">9.</span> act-class tools? <span class="gate">refused by policy (DRAFT)</span> — human presses publish</span>
+<span class="n">10.</span> <span class="ans">final answer</span> + cited sha256 → persisted; turn events stream over WS; per-turn tokens accounted
+<span class="note">     every message, tool call, and token lands in butler_messages — the session is replayable from rows alone</span></span></div>
+</body>
+</html>
