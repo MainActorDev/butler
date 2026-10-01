@@ -139,7 +139,7 @@ export class SqliteStorage implements Storage {
   }
 
   async sessionMessages(sessionId: string): Promise<MessageRow[]> {
-    return this.db.prepare('SELECT * FROM butler_messages WHERE session_id = ? ORDER BY created_at, id').all(sessionId) as MessageRow[];
+    return this.db.prepare('SELECT * FROM butler_messages WHERE session_id = ? ORDER BY rowid').all(sessionId) as MessageRow[];
   }
 
   async insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at'>): Promise<NoteRow> {
