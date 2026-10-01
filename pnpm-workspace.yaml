@@ -1,0 +1,7 @@
+packages:
+  - .
+# pnpm 10+/11 blocks native postinstall scripts unless allowlisted (supply-chain
+# protection — same policy as Lionidas). These compile native code.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
