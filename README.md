@@ -1,23 +1,43 @@
-# Butler
+<div align="center">
+  <img src="docs/assets/butler-mascot.png" width="160" alt="Butler" />
+</div>
 
-A reusable agent runtime: an OpenAI-compatible provider, a bounded tool-calling
-loop, permission-gated tool registry, layered memory (sessions, provenance-stamped
-notes, content-addressed documents), source ingestion, and conversation-API +
-MCP transports. Consumers bring their own tools, sources, and policy — Butler
-is the butler, not the household.
+<h1 align="center">Butler</h1>
 
-**Try it** — the generic demo consumer (`demo/`) exercises every subsystem and
-doubles as the executable quickstart:
+<p align="center"><strong>The reusable agent runtime. Your tools, your policy — his service.</strong></p>
 
-```bash
-pnpm install
-npx tsx demo/app.ts        # mock provider; set BUTLER_PROVIDER_BASE_URL for live
-# POST /api/agent/sessions · WS /ws (butler.* events) · POST /mcp (MCP)
-```
+<p align="center">
+  <img src="https://img.shields.io/badge/tests-61%20passing-brightgreen" alt="tests" />
+  <img src="https://img.shields.io/badge/node-24.12-blue" alt="node" />
+  <img src="https://img.shields.io/badge/provider-OpenAI--compatible-blueviolet" alt="provider" />
+  <img src="https://img.shields.io/badge/surfaces-conversation%20API%20%C2%B7%20MCP-teal" alt="surfaces" />
+</p>
+
+<p align="center">
+  <a href="#architecture--flow">Architecture</a> ·
+  <a href="#the-authoring-flow">Flow</a> ·
+  <a href="#what-butler-does">What it does</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#design-invariants">Invariants</a> ·
+  <a href="#docs-map">Docs</a>
+</p>
+
+---
+
+Butler is a reusable agent runtime: an OpenAI-compatible provider, a bounded
+tool-calling loop, permission-gated tools, layered memory with provenance,
+multi-source ingestion, and conversation-API + MCP transports — all in one
+importable package. A consumer (the generic `demo/` today, Lionidas tomorrow)
+brings its own tools, sources, and policy; Butler brings the loop. He is the
+butler, not the household.
+
+**Live-proven:** a 10-hop authoring session against `glm-5.3-flash` searched
+ingested tickets, drafted a spec, was corrected by the validator **twice**
+(external signal — never model self-critique), reached VALID, and cited the
+exact document sha256. Verified against the database, not the answer text
+(`docs/drills.md`).
 
 ## Architecture & flow
-
-**Layer map** (top = what consumers see, bottom = what Butler owns):
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -51,8 +71,9 @@ npx tsx demo/app.ts        # mock provider; set BUTLER_PROVIDER_BASE_URL for liv
 
 Rendered diagram: `docs/architecture.html`.
 
-**The authoring flow** (live-proven against glm-5.3-flash — see
-`docs/drills.md`):
+## The authoring flow
+
+Live-proven against glm-5.3-flash (`docs/drills.md`):
 
 ```
 1.  user message → conversation API (or MCP tools/call — same registry)
@@ -70,6 +91,44 @@ Rendered diagram: `docs/architecture.html`.
 Every message, tool call, and token lands in `butler_messages` — a session is
 replayable from rows alone.
 
+## What Butler does
+
+| You bring | Butler brings |
+|---|---|
+| Provider config (any OpenAI-compatible base URL + key + model) | Retries capped by YOUR wall budget, per-call timeouts, deterministic mock |
+| Tools with permission classes (`read`/`draft`/`act`) | The bounded ReAct loop, typed policy refusals, provider-visible filtering |
+| A validator tool as ground truth | The authoring eval that judges drafts by it — never model self-report |
+| Sources (`file`/`jira`/`github`/`repo`) + an artifacts dir | sha256 content-addressed ingestion, structural chunking, BM25 retrieval |
+| A sqlite file and a Fastify app | Idempotent migrations, sessions/notes/documents, conversation API + MCP |
+
+## Quickstart
+
+```bash
+pnpm install
+npx tsx demo/app.ts     # mock provider; set BUTLER_PROVIDER_BASE_URL for live
+# POST /api/agent/sessions · WS /ws (butler.* events) · POST /mcp (MCP)
+```
+
+```bash
+curl -X POST localhost:8790/api/agent/sessions -H 'content-type: application/json' -d '{}'
+curl -X POST localhost:8790/api/agent/sessions/<id>/messages \
+  -H 'content-type: application/json' -d '{"content":"draft a spec from the tickets"}'
+```
+
+## Design invariants
+
+- **Dependency direction is one way.** Consumers import Butler; Butler never
+  imports app code. The boundary test fails CI on leakage.
+- **Autonomy is a policy, not a fork.** Act-class tools are registered and
+  REFUSED under `DRAFT` — the refusal is the product behavior.
+- **Validators are the ground truth.** The model never grades its own draft.
+- **Provenance is mandatory.** Notes without a source ref are rejected;
+  supersession, never deletion.
+- **The loop owns the wall clock.** A hanging provider is aborted at the
+  deadline — budgets hold even when the model misbehaves.
+- **Every claim has a test that can fail.** Evals ship with a canary that
+  proves the harness detects regressions.
+
 ## Status — v0.1, all stages shipped
 
 - [x] Stage 0 — repo skeleton, boundary guard (fails on app-import leakage)
@@ -82,15 +141,15 @@ replayable from rows alone.
 61 tests green (`pnpm check` = tsc + vitest, hermetic — mock provider, zero
 network in CI).
 
-## Docs
+## Docs map
 
-- `docs/architecture.html` — the layer/flow diagram, rendered
-- `docs/api.md` — the package surface with runnable snippets
-- `docs/consumers.md` — the adoption contract (what you bring / what you get)
-- `docs/drills.md` — live verification log (condition 3: glm-5.3-flash,
-  10-hop authoring loop, sha citation verified against the DB)
-- `ROADMAP.md` — deferred machinery (orchestration L2 seams + triggers,
-  embeddings, postgres driver, MCP stdio)
+| Doc | What's in it |
+|---|---|
+| `docs/architecture.html` | The layer/flow diagram, rendered |
+| `docs/api.md` | The package surface with runnable snippets |
+| `docs/consumers.md` | The adoption contract (what you bring / what you get) |
+| `docs/drills.md` | Live verification log (condition 3: glm-5.3-flash) |
+| `ROADMAP.md` | Deferred machinery (orchestration L2 seams + triggers, embeddings, postgres, MCP stdio) |
 
 Plan of record: `plans/20261001T035356Z-agentic-infrastructure-core-plan.md`
 (rev 3.1, in the Lionidas repo).
