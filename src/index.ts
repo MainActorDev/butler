@@ -31,3 +31,7 @@ export { registerConversationApi } from './transport/conversation.ts';
 export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts';
 export { mountMcp } from './transport/mcp.ts';
 export type { McpMountOpts } from './transport/mcp.ts';
+
+// Stage 5 — eval harness
+export { evalRetrieval, evalBudget, evalAuthoring } from './eval.ts';
+export type { EvalResult, EvalCase, RetrievalEvalInput, BudgetEvalInput, AuthoringEvalInput } from './eval.ts';

@@ -13,7 +13,12 @@ let demo: DemoBuild;
 let baseUrl: string;
 
 beforeAll(async () => {
+  // the suite is hermetic: force the mock provider even when BUTLER_* env
+  // leaks from a developer shell (live drills run via demo/app.ts directly)
+  const saved = process.env['BUTLER_PROVIDER_BASE_URL'];
+  delete process.env['BUTLER_PROVIDER_BASE_URL'];
   demo = await buildDemo();
+  if (saved) process.env['BUTLER_PROVIDER_BASE_URL'] = saved;
   await demo.app.listen({ port: 0, host: '127.0.0.1' });
   const addr = demo.app.server.address();
   const port = typeof addr === 'object' && addr ? addr.port : 0;

@@ -22,10 +22,13 @@ is the butler, not the household.
 - [x] Stage 2 — tools + policy + sqlite memory
 - [x] Stage 3 — source ingestion + chunking + retrieval
 - [x] Stage 4 — generic demo consumer (conversation API + WS + MCP)
-- [ ] Stage 5 — eval harness + docs
+- [x] Stage 5 — eval harness + docs
 
-See `ROADMAP.md` for deferred machinery (orchestration L2 etc.) and the plan
-artifacts in the Lionidas repo (`plans/20261001T035356Z-agentic-infrastructure-core-plan.md`).
+Docs: `docs/api.md` (package surface) · `docs/consumers.md` (adoption
+contract) · `docs/drills.md` (live verification log — condition 3 proven
+against glm-5.3-flash). See `ROADMAP.md` for deferred machinery
+(orchestration L2 etc.) and the plan artifacts in the Lionidas repo
+(`plans/20261001T035356Z-agentic-infrastructure-core-plan.md`).
 
 ## Development
 
