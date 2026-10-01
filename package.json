@@ -2,7 +2,7 @@
   "name": "@mainactordev/butler",
   "version": "0.1.0",
   "private": true,
-  "description": "Butler — reusable agent runtime: provider, loop, tool registry, layered memory, source ingestion, conversation API + MCP transports (plan 20261001T035356Z)",
+  "description": "Butler \u2014 reusable agent runtime: provider, loop, tool registry, layered memory, source ingestion, conversation API + MCP transports (plan 20261001T035356Z)",
   "type": "module",
   "main": "src/index.ts",
   "exports": {
@@ -31,5 +31,8 @@
     "vitest": "^3.0.0",
     "ws": "^8.18.0",
     "yaml": "^2.9.0"
+  },
+  "bin": {
+    "butler-mcp": "bin/butler-mcp.ts"
   }
 }

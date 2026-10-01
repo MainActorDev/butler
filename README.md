@@ -146,6 +146,17 @@ with the live agent, watch tool calls stream, browse sessions/documents/
 notes. Scripted tour: `npx tsx demo/tour.ts`. Guided walkthrough:
 `docs/use-case-qa-spec.md`.
 
+**Mount in your MCP client (Claude Code / Codex / Hermes):**
+
+```json
+{ "mcpServers": { "butler": { "command": "npx",
+  "args": ["tsx", "/path/to/butler/bin/butler-mcp.ts"] } } }
+```
+
+Serves the demo registry over stdio (fixtures corpus, draft policy —
+`spec.publish` filtered out). Same registry as the HTTP/MCP transport:
+one tool set, every surface.
+
 ## Docs map
 
 | Doc | What's in it |
