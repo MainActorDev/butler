@@ -23,9 +23,9 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv: string[]): { registry?: string; policy: string; db: string } {
-  const out = { policy: 'draft', db: join(HERE, '..', 'butler-mcp.db') } as { registry?: string; policy: string; db: string };
+  const out = { policy: 'draft', db: join(HERE, '..', 'butler-mcp.db') } as { registry?: string | undefined; policy: string; db: string };
   for (let i = 2; i < argv.length; i++) {
-    if (argv[i] === '--registry') out.registry = argv[++i];
+    if (argv[i] === '--registry') out.registry = argv[i + 1] ?? undefined;
     else if (argv[i] === '--policy') out.policy = argv[++i] ?? 'draft';
     else if (argv[i] === '--db') out.db = argv[++i] ?? out.db;
   }
@@ -96,7 +96,7 @@ async function main(): Promise<void> {
     server.registerTool(
       tool.name,
       { description: `${tool.description} [${tool.permission}]`, inputSchema: z.object({ args: z.record(z.string(), z.unknown()).optional() }) },
-      async (input: { args?: Record<string, unknown> }) => {
+      async (input: { args?: Record<string, unknown> | undefined }) => {
         try {
           const out = await registry.execute(tool.name, input?.args ?? {}, { signal: undefined, sessionId: 'mcp-stdio' }, policy);
           return { content: [{ type: 'text' as const, text: out }] };

@@ -32,6 +32,10 @@ export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts'
 export { mountMcp } from './transport/mcp.ts';
 export type { McpMountOpts } from './transport/mcp.ts';
 
+// Roadmap stage D — orchestration L2
+export { fanOut, spawnTool, childBudgets } from './orchestrate/supervisor.ts';
+export type { ChildSpec, ChildReport, SupervisorDeps } from './orchestrate/supervisor.ts';
+
 // Stage 5 — eval harness
 export { evalRetrieval, evalBudget, evalAuthoring } from './eval.ts';
 export type { EvalResult, EvalCase, RetrievalEvalInput, BudgetEvalInput, AuthoringEvalInput } from './eval.ts';
