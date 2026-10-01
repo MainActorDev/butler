@@ -13,6 +13,9 @@ export interface McpMountOpts {
   registry: ToolRegistry;
   policy: Policy;
   serverInfo: { name: string; version: string };
+  /** optional instructions returned on initialize — clients inject this
+   *  into their model's context as 'how to use this server'. */
+  instructions?: string;
   /** mount path (default /mcp) */
   path?: string;
   /** context for executions */
@@ -27,7 +30,7 @@ export async function mountMcp(app: FastifyInstance, opts: McpMountOpts): Promis
   app.post(path, async (req, reply) => {
     // one server+transport per request (stateless mode); the SDK owns the
     // JSON-RPC lifecycle, we bridge to the SAME policy-gated registry
-    const real = new McpServer(opts.serverInfo);
+    const real = new McpServer({ ...opts.serverInfo, ...(opts.instructions ? { instructions: opts.instructions } : {}) });
     for (const tool of opts.registry.list()) {
       if (!permits(opts.policy, tool.permission)) continue;
       real.registerTool(
