@@ -25,3 +25,9 @@ export { jiraConnector, githubConnector } from './sources/jira-github.ts';
 export type { JiraSourceConfig, GithubSourceConfig } from './sources/jira-github.ts';
 export { repoConnector } from './sources/repo.ts';
 export type { RepoSourceConfig } from './sources/repo.ts';
+
+// Stage 4 — transports (conversation API + MCP; consumers mount these)
+export { registerConversationApi } from './transport/conversation.ts';
+export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts';
+export { mountMcp } from './transport/mcp.ts';
+export type { McpMountOpts } from './transport/mcp.ts';
