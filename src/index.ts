@@ -32,6 +32,10 @@ export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts'
 export { mountMcp } from './transport/mcp.ts';
 export type { McpMountOpts } from './transport/mcp.ts';
 
+// Roadmap stage E — embeddings + hybrid retrieval
+export { HashEmbedding, OpenAICompatEmbedding, cosine } from './embeddings/index.ts';
+export type { EmbeddingProvider } from './embeddings/index.ts';
+
 // Roadmap stage D — orchestration L2
 export { fanOut, spawnTool, childBudgets } from './orchestrate/supervisor.ts';
 export type { ChildSpec, ChildReport, SupervisorDeps } from './orchestrate/supervisor.ts';

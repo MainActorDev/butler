@@ -3,6 +3,7 @@
  *  okapi BM25 fallback keeps the contract on builds without fts5. SQL/keyword
  *  first per BEIR — embeddings are Layer 3, deferred (plan D8/ROADMAP). */
 import type { Storage, ChunkRow, NoteRow } from './contract.ts';
+import { HashEmbedding, cosine } from '../embeddings/index.ts';
 
 export interface RetrievedChunk {
   kind: 'chunk' | 'note';
@@ -46,14 +47,43 @@ export interface Retriever {
   retrieve(query: string, topK: number): Promise<RetrievedChunk[]>;
 }
 
+export interface RetrievalConfig {
+  /** 'bm25' (default, BEIR-first) | 'hybrid' (BM25 candidates → cosine rerank) */
+  mode?: 'bm25' | 'hybrid';
+  /** embedding provider for hybrid mode (HashEmbedding default = CI hermetic) */
+  embed?: import('../embeddings/index.ts').EmbeddingProvider;
+  /** how many BM25 candidates feed the rerank (default 50) */
+  rerankPool?: number;
+}
+
 export class StorageRetriever implements Retriever {
-  constructor(private readonly storage: Storage) {}
+  private readonly config: RetrievalConfig;
+  constructor(private readonly storage: Storage, config?: RetrievalConfig) {
+    this.config = config ?? {};
+  }
 
   async retrieve(query: string, topK: number): Promise<RetrievedChunk[]> {
-    // gather ALL chunks + active notes (v1 corpus is small; fts5 indexing is
-    // the Stage 3 scale upgrade when documents arrive in volume)
     const sources = await this.listAll();
-    return bm25Rank(query, sources).slice(0, topK);
+    const bm25 = bm25Rank(query, sources);
+    if (this.config.mode !== 'hybrid') return bm25.slice(0, topK);
+
+    // hybrid: embed candidates + query, cosine rerank (review/plan E — toggle
+    // gated, never silently replacing BM25; degradation = plain BM25 + warning)
+    const embed = this.config.embed ?? new HashEmbedding();
+    const pool = bm25.slice(0, this.config.rerankPool ?? 50);
+    if (pool.length === 0) return [];
+    try {
+      const [qv, dvs] = await Promise.all([embed.embed([query]), embed.embed(pool.map((p) => p.content))]);
+      const queryVec = qv[0] ?? [];
+      const reranked = pool
+        .map((c, i) => ({ c, score: cosine(queryVec, dvs[i] ?? []) }))
+        .sort((a, z) => z.score - a.score)
+        .map(({ c, score }) => ({ ...c, score: Math.round(score * 1000) / 1000 }));
+      return reranked.slice(0, topK);
+    } catch (err) {
+      console.warn(`hybrid retrieval degraded to BM25: ${err instanceof Error ? err.message : String(err)}`);
+      return bm25.slice(0, topK);
+    }
   }
 
   private async listAll(): Promise<Bm25Doc[]> {
