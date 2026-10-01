@@ -32,6 +32,9 @@ export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts'
 export { mountMcp } from './transport/mcp.ts';
 export type { McpMountOpts } from './transport/mcp.ts';
 
+// Roadmap stage F — postgres storage driver
+export { PostgresStorage } from './memory/postgres.ts';
+
 // Roadmap stage E — embeddings + hybrid retrieval
 export { HashEmbedding, OpenAICompatEmbedding, cosine } from './embeddings/index.ts';
 export type { EmbeddingProvider } from './embeddings/index.ts';

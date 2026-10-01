@@ -19,7 +19,7 @@ cancellation-graph hardening beyond the single-process AbortSignal chain.
 
 - Embeddings/vector retrieval (Layer 3) — only on the documented trigger: a real
   query SQL+notes cannot answer.
-- Postgres storage driver — interface ships in v1; driver when a consumer needs it.
+- ~~Postgres storage driver~~ ✅ built (src/memory/postgres.ts; contract suite parameterized over both drivers — pg leg runs when BUTLER_TEST_PG is set, skips honestly otherwise; no local pg on this machine at build time, so the pg leg ran skipped: mechanism reviewed, execution awaits a pg instance).
 - ~~MCP stdio bin~~ ✅ built (bin/butler-mcp.ts, proven with a real SDK client over stdio).
 - tree-sitter symbol indexing — repo connector v1 is tree + grep + file fetch.
 - Lionidas integration — its own plan in the Lionidas repo (seed: plan
