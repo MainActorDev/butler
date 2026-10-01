@@ -4,6 +4,7 @@
  *  policy REFUSES (condition 5). Doubles as the executable quickstart. */
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
+import fastifyStatic from '@fastify/static';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SqliteStorage } from '../src/memory/sqlite.ts';
@@ -168,6 +169,12 @@ export async function buildDemo(opts?: { scripted?: ScriptedTurn[]; policy?: Pol
       }
     });
   }
+
+  // serve the built demo UI at / (dev: `pnpm -C demo/ui dev` proxies /api,/ws,/mcp)
+  const uiDist = join(HERE, 'ui', 'dist');
+  try {
+    await app.register(fastifyStatic, { root: uiDist });
+  } catch { /* dist not built — API-only mode (tests) */ }
 
   await registerConversationApi(app, {
     storage, provider, registry, policy,

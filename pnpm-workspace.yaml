@@ -1,5 +1,6 @@
 packages:
   - .
+  - demo/ui
 # pnpm 10+/11 blocks native postinstall scripts unless allowlisted (supply-chain
 # protection — same policy as Lionidas). These compile native code.
 allowBuilds:
