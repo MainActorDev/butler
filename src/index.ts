@@ -32,6 +32,10 @@ export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts'
 export { mountMcp } from './transport/mcp.ts';
 export type { McpMountOpts } from './transport/mcp.ts';
 
+// Roadmap stage G — symbol chunks (repo sources opt-in)
+export { extractSymbols, symbolChunks } from './sources/tree-sitter.ts';
+export type { SymbolInfo, SymbolChunk } from './sources/tree-sitter.ts';
+
 // Roadmap stage F — postgres storage driver
 export { PostgresStorage } from './memory/postgres.ts';
 

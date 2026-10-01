@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { NormalizedDocument, SourceConnector } from './connector.ts';
+import { symbolChunks } from './tree-sitter.ts';
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.venv', '__pycache__', 'DerivedData']);
 const TEXT_EXT = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml', '.txt', '.css', '.scss', '.html', '.swift', '.kt', '.go', '.rs', '.py', '.rb', '.java', '.sql', '.sh']);
@@ -19,6 +20,8 @@ export interface RepoSourceConfig {
   maxFiles?: number;
   /** include the tree doc (default true) */
   treeDoc?: boolean;
+  /** emit symbol chunks for TS/JS-family files (plan Stage G) */
+  symbols?: boolean;
 }
 
 function listRepoFiles(root: string, maxFiles: number, maxBytes: number): string[] {
@@ -65,6 +68,12 @@ export function repoConnector(sourceId: string, cfg: RepoSourceConfig): SourceCo
         for (const f of files) {
           const rel = relative(root, f);
           out.push({ uri: `repo://${rel}`, title: rel, content: readFileSync(f, 'utf8'), kind: 'plain' });
+          if (cfg.symbols) {
+            // symbol chunks ride the SAME pipeline: they're just more chunks
+            // for this doc's kind, retrievable by "symbol: name (kind)"
+            const sym = symbolChunks(readFileSync(f, 'utf8'), rel);
+            if (sym.length > 0) out.push({ uri: `repo://${rel}#symbols`, title: `${rel} (symbols)`, content: sym.map((s) => `${s.headingPath}\n${s.content}`).join('\n\n'), kind: 'symbols' });
+          }
         }
         return out;
       } finally {

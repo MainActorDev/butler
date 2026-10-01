@@ -138,8 +138,13 @@ curl -X POST localhost:8790/api/agent/sessions/<id>/messages \
 - [x] Stage 4 — generic demo consumer (conversation API + WS + MCP)
 - [x] Stage 5 — eval harness + canary + consumer docs
 
-71 tests green (`pnpm check` = tsc + vitest + UI build, hermetic — mock
+91 tests green (`pnpm check` = tsc + vitest + UI build, hermetic — mock
 provider, zero network in CI).
+
+**Roadmap complete** (except Lionidas integration, by decision): demo tour +
+Vue UI ✅ · MCP stdio bin ✅ · orchestration L2 (supervisor, budget roll-up,
+named-skip) ✅ · embeddings + hybrid retrieval (BM25 default) ✅ · postgres
+driver (contract-parameterized) ✅ · symbol chunks (repo sources opt-in) ✅.
 
 **Try the UI:** `npx tsx demo/app.ts` → open http://127.0.0.1:8790 — chat
 with the live agent, watch tool calls stream, browse sessions/documents/

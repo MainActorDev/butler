@@ -21,6 +21,11 @@ cancellation-graph hardening beyond the single-process AbortSignal chain.
   query SQL+notes cannot answer.
 - ~~Postgres storage driver~~ ✅ built (src/memory/postgres.ts; contract suite parameterized over both drivers — pg leg runs when BUTLER_TEST_PG is set, skips honestly otherwise; no local pg on this machine at build time, so the pg leg ran skipped: mechanism reviewed, execution awaits a pg instance).
 - ~~MCP stdio bin~~ ✅ built (bin/butler-mcp.ts, proven with a real SDK client over stdio).
-- tree-sitter symbol indexing — repo connector v1 is tree + grep + file fetch.
+- ~~tree-sitter symbol indexing~~ ✅ built as a DEPENDENCY-FREE structural scan
+  (src/sources/tree-sitter.ts: TS/JS-family symbols with kinds+lines; repo
+  connector `symbols: true` emits #symbols docs riding the normal chunk
+  pipeline). The web-tree-sitter upgrade (real grammars, more languages)
+  swaps extractSymbols() internals only — deferred until a consumer needs
+  non-TS symbol depth; the chunk SHAPE is shipped and tested.
 - Lionidas integration — its own plan in the Lionidas repo (seed: plan
   `20261001T035356Z` follow-up section).
