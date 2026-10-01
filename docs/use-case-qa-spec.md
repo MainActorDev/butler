@@ -49,7 +49,7 @@ WebSocket as it happens):
    their sha256 refs)
 2. `docs.get` — it pulls the full ticket by sha256 prefix
 3. `spec.draft` — first draft recorded
-4. `spec.validate` — **watch this one closely.** In the live drill the model
+4. `spec.validate` — **watch this one closely.** (Tool calls and verdicts stream in live; the final answer text arrives at once when the turn ends.) In the live drill the model
    got the spec shape wrong TWICE (`INVALID: steps required`, then
    `INVALID: steps[N]: {action: string} required`) and repaired itself each
    time before the validator said **VALID**. The verdict badge in the UI

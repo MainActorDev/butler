@@ -1,7 +1,7 @@
 # Butler roadmap completion — demo UI, orchestration L2, embeddings, drivers
 
 - Source brainstorm: `../lionidas/brainstorm/20261001T102213Z-butler-roadmap-completion.md` (all material questions answered 2026-10-01)
-- Status: **Ready**
+- Status: **Ready** (rev 2, 2026-10-01 — review F1–F7 applied: `reviews/20261001T102213Z-butler-roadmap-completion-plan-review.md`)
 - Plan date: 2026-10-01
 - Home: Butler repo (`plans/` convention starts here — Butler is a standalone product; the brainstorm lives in Lionidas only because the conversation started there)
 
@@ -23,7 +23,7 @@ Make Butler **legible** (a Vue demo UI that shows, live, what the agent is doing
 ## Completion conditions (measurable)
 
 1. `demo/tour.ts` runs N scripted scenarios end-to-end in CI (hermetic) printing a narrated transcript — search→draft→validate→repair→VALID→refusal-of-act all appear.
-2. The Vue demo UI: served by the demo app at `/`, against the LIVE z.ai chat endpoint a user can hold a session, watch tool calls stream in real time (WS `butler.*` events), see validator verdicts inline, and browse sessions/notes/documents — using ONLY public API/WS/MCP surfaces (no internals).
+2. The Vue demo UI: served by the demo app at `/`, against the LIVE z.ai chat endpoint a user can hold a session, watch tool calls and validator verdicts arrive live (WS `butler.*` hop events; the final answer lands at `turn.end` — token-delta streaming is a ROADMAP item, not this plan), and browse sessions/notes/documents over the B.0 routes — using ONLY public API/WS/MCP surfaces (no internals).
 3. `butler-mcp` stdio bin: an MCP client config line can mount Butler's registry over stdio (verified with the SDK's own client in a test).
 4. Orchestration L2: a supervisor session spawns child sessions (parent_session_id populated); children run CONCURRENTLY with independent budgets that roll up to the parent's caps; aborting the parent cancels children (in-flight provider calls aborted, no orphaned rows); the supervisor receives summaries, not transcripts; an `eval-orchestration` family runs N authoring fixtures concurrently and asserts the fan-out completes within budget.
 5. Embedding seam: `EmbeddingProvider` interface + OpenAI-compatible HTTP adapter + deterministic hash-based mock (CI hermetic). `StorageRetriever` gains hybrid mode (BM25 + cosine rerank) behind a config toggle; the retrieval eval measures BM25 vs hybrid on a synthetic corpus (≥200 docs) and the result is asserted + logged — the toggle never silently replaces BM25.
@@ -67,10 +67,20 @@ src/sources/tree-sitter.ts   symbol chunks for repo sources (opt-in)
 - **Deliverable:** condition 1; `npx tsx demo/tour.ts` is the 60-second answer to "what can Butler do".
 
 ### Stage B — Vue demo UI (the reference consumer)
-- `demo/ui/` Vue 3 + Vite: chat pane (session create + message POST), live activity feed (WS `butler.*` events → streaming tool-call cards with expand/collapse), validator verdict badges, sessions/notes/documents browsers (GET endpoints; a small read-only JSON view).
-- Demo app serves the built UI at `/` and keeps a dev proxy; `.env` creds drive the live chat provider (verified working); mock fallback labeled in the UI header.
-- Talks ONLY to `/api/agent/*`, `/ws`, `/mcp` — boundary test asserts `demo/ui/src` imports no `../../src` internals.
-- **Deliverable:** condition 2; manual live drill logged in `docs/drills.md`; UI build added to `pnpm check`.
+
+**B.0 — consumer API completion (review F1/F3; ships BEFORE the UI):** the conversation transport gains the four surfaces the UI (and `docs/use-case-qa-spec.md`) requires, all consumer-facing with contract tests:
+- `POST /api/agent/sessions/:id/abort` — registers per-session AbortControllers at turn start; the loop already accepts `signal`; abort → clean `ABORTED` outcome, partial transcript persisted.
+- `GET /api/agent/sessions` — list (backs the Sessions browser; `listSessions` exists at sqlite.ts:129, unexposed).
+- `GET /api/agent/documents` + `GET /api/agent/notes` — read-only lists for the browsers (sha, uri, title, chunks; notes with provenance + supersession state).
+- **Core-side note injection (F3):** the conversation API appends top-N active notes (matching the session scope; corpus is small) to the system prompt, provenance-marked. Test: note saved in session 1 → session 2's first provider call includes it (assert on the persisted system/user messages).
+- `@fastify/static` mount at `/` serving the built UI (B's build output).
+
+- `demo/ui/` Vue 3 + Vite: chat pane (session create + message POST), live activity feed (WS `butler.*` events → tool-call cards with expand/collapse as they happen), validator verdict badges, sessions/notes/documents browsers over the B.0 routes.
+- **Honest streaming scope (review F2):** what streams live is the tool-call/verdict SEQUENCE (turn.start → tool.call → tool.result → …); the final ANSWER text arrives whole at `turn.end`. Token-level delta streaming is NOT in this plan — it moves to ROADMAP as its own eval'd stage (provider `stream:true` + `butler.delta` events).
+- Demo app serves the built UI at `/` (B.0 static mount) and keeps a dev proxy; `.env` creds drive the live chat provider (verified working); mock fallback labeled in the UI header.
+- Talks ONLY to `/api/agent/*`, `/ws`, `/mcp` — boundary test (review F6 phrasing): `demo/ui/**` must not import `../src/**` directly; package types come via the public barrel only, and the cleanest UI uses fetch/WS exclusively.
+- `demo/ui` gains `check` = `vue-tsc --noEmit && vite build`; root `pnpm check` chains it (review F7).
+- **Deliverable:** condition 2 (honestly scoped); manual live drill logged in `docs/drills.md`; UI build in `pnpm check`.
 
 ### Stage C — MCP stdio bin
 - `bin/butler-mcp.ts`: builds a demo-configured registry (or loads a consumer module path via `--registry <module>`) and serves it over the SDK's stdio transport.
@@ -79,7 +89,7 @@ src/sources/tree-sitter.ts   symbol chunks for repo sources (opt-in)
 - **Deliverable:** condition 3.
 
 ### Stage D — Orchestration L2 (evals first, per the D16 deal)
-- **D.0 evals before machinery:** `eval-orchestration` family — fan out N=4 authoring fixtures concurrently; assert all complete, budgets respected (parent token cap ≥ sum of child spend), wall time < serial time (bounded, deterministic mocks).
+- **D.0 evals before machinery:** `eval-orchestration` family — fan out N=4 authoring fixtures concurrently; assert all complete, budgets respected (parent token cap ≥ sum of child spend), and concurrency proven STRUCTURALLY, not by wall clock (review F4): assert interleaving evidence — ≥2 children had an in-flight provider call simultaneously, recorded via event ordering with deterministic mocks. Wall time is logged as a local-only metric, never a CI assertion.
 - `budgets.ts`: child budget = share of parent REMAINING (tokens pro-rata, wall = parent deadline minus elapsed); overflow → child gets `BUDGET_EXCEEDED`, supervisor observes, fan-out continues (named-skip semantics, never abort the batch).
 - `cancel.ts`: `AbortSignal.any` graph parent→children→provider; parent abort mid-fanout → all children settle with partial transcripts persisted (resumable), zero orphan rows (each child row carries parent_session_id — the seam from Stage 2 finally earns its keep).
 - `supervisor.ts`: `spawn` becomes a REAL tool (draft-class); children get narrowed system prompts; supervisor receives `{childId, summary, tokens, verdict}` — summaries, never transcripts (context economy).
@@ -125,7 +135,7 @@ src/sources/tree-sitter.ts   symbol chunks for repo sources (opt-in)
 
 ## Open items (non-blocking, operator input at build time)
 
-1. **Q-embeddings endpoint (Stage E live drill):** z.ai global has NO embeddings (R5). Options: (a) mainland `open.bigmodel.cn/api/paas/v4` with the same key (untested — different platform, may need separate account); (b) any other OpenAI-compatible embeddings endpoint you have; (c) ship hybrid with mock embeddings only and run the live comparison later. The seam is endpoint-agnostic; this only gates the LIVE drill, not the build.
+1. **Q-embeddings endpoint (Stage E live drill):** z.ai global has NO embeddings (R5), and the mainland `open.bigmodel.cn` platform rejects the current key (probed 2026-10-01: `1211 模型不存在` — cross-platform keys do not carry; review F5). Options: (a) a SEPARATE mainland account/key; (b) any other OpenAI-compatible embeddings endpoint; (c) **default if unanswered: ship hybrid with mock embeddings only, run the live comparison later.** The seam is endpoint-agnostic; this only gates the LIVE drill, not the build.
 2. **Q-pg test instance (Stage F):** local postgres via Docker for the parameterized leg, or always-skip in CI with sqlite-only? (Default: skip-honestly unless `BUTLER_TEST_PG` set.)
 
 ## Rollout

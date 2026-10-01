@@ -2,7 +2,8 @@
 
 - Plan reviewed: `plans/20261001T102213Z-butler-roadmap-completion-plan.md` (Ready, 2026-10-01, single version)
 - Evidence sources: the plan; source brainstorm `../lionidas/brainstorm/20261001T102213Z-butler-roadmap-completion.md` (all answers verified present); Butler repo state verified 2026-10-01 — `src/transport/conversation.ts` (routes: POST sessions, GET /:id, POST messages ONLY; zero abort handling), `src/loop.ts` (onEvent emits hop-level events; NO token streaming deltas), `src/memory/sqlite.ts:129` (listSessions exists, unexposed), `demo/app.ts` (no static serving); live probe: z.ai MAINLAND `open.bigmodel.cn/api/paas/v4/embeddings` with the same key → `1211 模型不存在` (dead for Q-embeddings option (a)); `docs/use-case-qa-spec.md` (the user-facing walkthrough whose claims the UI must honor).
-- Verdict: **Needs revision** — 2 High (both about plan-vs-reality gaps that will bite mid-build), 3 Medium, 2 Low. All corrections are plan edits; no operator decisions strictly required (Q1/Q2 already handled as open items).
+- Verdict: **Ready for implementation** (updated 2026-10-01, plan rev 2): all seven findings applied — F1 → Stage B.0 (abort/list/static + contract tests), F2 → honest streaming scope + delta streaming to ROADMAP, F3 → note injection with test, F4 → structural concurrency assertion, F5 → Q-embeddings corrected (default mock-only), F6/F7 → boundary phrasing + UI check script. Use-case doc aligned. Findings preserved below.
+- Original verdict (rev 1): **Needs revision** — 2 High, 3 Medium, 2 Low; plan edits only, no operator decisions required.
 
 ## Traceability
 
