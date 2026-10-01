@@ -83,7 +83,10 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     try {
       res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal });
     } catch (err) {
-      if (deps.signal?.aborted && !wallSignal.aborted) throw new LoopError('aborted by caller', 'ABORTED', messages);
+      // caller abort vs wall timeout: AbortSignal.timeout raises TimeoutError;
+      // a caller signal abort propagates AbortError (or a custom reason)
+      const isWallTimeout = err instanceof Error && err.name === 'TimeoutError';
+      if (deps.signal?.aborted && !isWallTimeout) throw new LoopError('aborted by caller', 'ABORTED', messages);
       // provider exhausted its own retries/timeouts — surface with partial transcript
       const pe = err instanceof ProviderError ? err : null;
       const msg = pe ? `${pe.code}: ${pe.message}`

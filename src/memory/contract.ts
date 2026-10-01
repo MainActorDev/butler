@@ -105,6 +105,7 @@ export interface Storage {
   getSource(id: string): Promise<SourceRow | null>;
   upsertDocument(d: DocumentRow): Promise<void>;
   getDocument(sha256: string): Promise<DocumentRow | null>;
+  listDocuments(limit: number): Promise<DocumentRow[]>;
   insertChunks(docSha: string, chunks: Array<Omit<ChunkRow, 'id' | 'doc_sha256'>>): Promise<void>;
   documentChunks(docSha: string): Promise<ChunkRow[]>;
 
