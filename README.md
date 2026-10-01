@@ -13,7 +13,7 @@ is the butler, not the household.
 
 - [x] Stage 0 — repo skeleton, boundary guard, ROADMAP
 - [x] Stage 1 — provider + loop (mock-driven)
-- [ ] Stage 2 — tools + policy + sqlite memory
+- [x] Stage 2 — tools + policy + sqlite memory
 - [ ] Stage 3 — source ingestion + chunking + retrieval
 - [ ] Stage 4 — generic demo consumer (conversation API + WS + MCP)
 - [ ] Stage 5 — eval harness + docs
