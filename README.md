@@ -138,8 +138,13 @@ curl -X POST localhost:8790/api/agent/sessions/<id>/messages \
 - [x] Stage 4 — generic demo consumer (conversation API + WS + MCP)
 - [x] Stage 5 — eval harness + canary + consumer docs
 
-61 tests green (`pnpm check` = tsc + vitest, hermetic — mock provider, zero
-network in CI).
+71 tests green (`pnpm check` = tsc + vitest + UI build, hermetic — mock
+provider, zero network in CI).
+
+**Try the UI:** `npx tsx demo/app.ts` → open http://127.0.0.1:8790 — chat
+with the live agent, watch tool calls stream, browse sessions/documents/
+notes. Scripted tour: `npx tsx demo/tour.ts`. Guided walkthrough:
+`docs/use-case-qa-spec.md`.
 
 ## Docs map
 

@@ -26,3 +26,17 @@
 
 Clean boot on :8791; session created; message turn ran; answer honestly
 labeled "(mock provider — set BUTLER_PROVIDER_BASE_URL for live)"; hops=2.
+
+
+## 2026-10-01 — Stage A/B live drills
+
+- **Tour (condition 1):** `npx tsx demo/tour.ts` — all beats present
+  (search/get/draft/INVALID×2/VALID/refusal/tokens), 10ms wall, exit 0.
+- **B.0 abort (review F1):** 30s-hanging provider aborted mid-flight via
+  POST /abort → clean ABORTED outcome, partial transcript persisted. Surfaced
+  and fixed a real loop bug (caller-abort was classified BUDGET_EXCEEDED).
+- **Vue UI end-to-end (browser, glm-5.3-flash):** session → DEMO-101 ask →
+  9 hops with live tool-call feed → answer VALID citing sha 5f8f5f7c…32c33
+  (matches documents browser) → agent unpromptedly saved a provenance note →
+  sessions browser 11105/1487 tokens → thread reopened from rows (17 msgs).
+  Drill caught one UI bug (sessions list wrapper) — fixed + re-verified.
