@@ -195,6 +195,10 @@ export class SqliteStorage implements Storage {
     return (this.db.prepare('SELECT * FROM butler_documents WHERE sha256 = ?').get(sha256) as DocumentRow | undefined) ?? null;
   }
 
+  async listDocuments(limit: number): Promise<DocumentRow[]> {
+    return this.db.prepare('SELECT * FROM butler_documents ORDER BY fetched_at DESC LIMIT ?').all(limit) as DocumentRow[];
+  }
+
   async insertChunks(docSha: string, chunks: Array<Omit<ChunkRow, 'id' | 'doc_sha256'>>): Promise<void> {
     const tx = this.db.transaction((list: Array<Omit<ChunkRow, 'id' | 'doc_sha256'>>) => {
       this.db.prepare('DELETE FROM butler_document_chunks WHERE doc_sha256 = ?').run(docSha);

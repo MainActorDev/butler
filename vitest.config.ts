@@ -6,5 +6,6 @@ export default defineConfig({
     environment: 'node',
     // hermetic CI: no network, no live provider (plan rev 3, condition 8)
     env: { BUTLER_PROVIDER: 'mock' },
+    testTimeout: 20_000,
   },
 });

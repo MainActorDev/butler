@@ -138,8 +138,29 @@ curl -X POST localhost:8790/api/agent/sessions/<id>/messages \
 - [x] Stage 4 — generic demo consumer (conversation API + WS + MCP)
 - [x] Stage 5 — eval harness + canary + consumer docs
 
-61 tests green (`pnpm check` = tsc + vitest, hermetic — mock provider, zero
-network in CI).
+91 tests green (`pnpm check` = tsc + vitest + UI build, hermetic — mock
+provider, zero network in CI).
+
+**Roadmap complete** (except Lionidas integration, by decision): demo tour +
+Vue UI ✅ · MCP stdio bin ✅ · orchestration L2 (supervisor, budget roll-up,
+named-skip) ✅ · embeddings + hybrid retrieval (BM25 default) ✅ · postgres
+driver (contract-parameterized) ✅ · symbol chunks (repo sources opt-in) ✅.
+
+**Try the UI:** `npx tsx demo/app.ts` → open http://127.0.0.1:8790 — chat
+with the live agent, watch tool calls stream, browse sessions/documents/
+notes. Scripted tour: `npx tsx demo/tour.ts`. Guided walkthrough:
+`docs/use-case-qa-spec.md`.
+
+**Mount in your MCP client (Claude Code / Codex / Hermes):**
+
+```json
+{ "mcpServers": { "butler": { "command": "npx",
+  "args": ["tsx", "/path/to/butler/bin/butler-mcp.ts"] } } }
+```
+
+Serves the demo registry over stdio (fixtures corpus, draft policy —
+`spec.publish` filtered out). Same registry as the HTTP/MCP transport:
+one tool set, every surface.
 
 ## Docs map
 

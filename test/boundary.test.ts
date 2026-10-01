@@ -18,6 +18,7 @@ const ALLOWED_PACKAGES = new Set([
   'fastify',
   'ws',
   'yaml',
+  'pg',
   'zod',
   'node:fs', 'node:path', 'node:os', 'node:crypto', 'node:util', 'node:events',
   'node:child_process', 'node:url', 'node:buffer', 'node:stream', 'node:abort-controller',

@@ -31,8 +31,38 @@ export interface TurnOutcome {
   hops: number;
 }
 
+/** active turns: session id → AbortController (review F1 — abort support) */
+const activeTurns = new Map<string, AbortController>();
+
 export async function registerConversationApi(app: FastifyInstance, deps: ConversationDeps): Promise<void> {
   const { storage, registry, policy } = deps;
+
+  // ── consumer API completion (plan Stage B.0) ──
+
+  // sessions list (Sessions browser)
+  app.get('/api/agent/sessions', async (req) => {
+    const q = req.query as { limit?: string };
+    const limit = Math.min(Number.parseInt(q.limit ?? '50', 10) || 50, 200);
+    return { sessions: await storage.listSessions(limit) };
+  });
+
+  // documents list (Documents browser)
+  app.get('/api/agent/documents', async () => {
+    const docs = await storage.listDocuments(200);
+    return { documents: docs };
+  });
+
+  // notes list, provenance included (Notes browser)
+  app.get('/api/agent/notes', async () => ({ notes: await storage.activeNotes() }));
+
+  // abort the active turn (review F1): clean ABORTED outcome, partial transcript persisted
+  app.post('/api/agent/sessions/:id/abort', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const ac = activeTurns.get(id);
+    if (!ac) return reply.code(409).send({ error: 'no active turn on this session' });
+    ac.abort();
+    return { aborting: true };
+  });
 
   app.post('/api/agent/sessions', async (req, reply) => {
     const b = (req.body ?? {}) as { title?: string; userId?: string };
@@ -64,11 +94,19 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content ?? '' }));
 
     const outcome: TurnOutcome = { sessionId: id, ok: false, tokens: { in: 0, out: 0 }, hops: 0 };
+    const ac = new AbortController();
+    activeTurns.set(id, ac);
     try {
-      const result = await runLoop(deps.systemPrompt, b.content, {
+      // core-side note injection (review F3): active notes ride the system
+      // prompt, provenance-marked — knowledge crosses sessions
+      const notes = await storage.activeNotes();
+      const notesLines = notes.slice(0, 20).map((n) => `- [${n.kind} ${n.scope_key}] ${n.content} (source: ${n.source_ref})`).join('\n');
+      const notesBlock = notes.length ? `\n\n## Known notes (provenance-stamped memory)\n${notesLines}` : '';
+      const result = await runLoop(deps.systemPrompt + notesBlock, b.content, {
         provider: deps.provider,
         tools: registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission)).map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),
+        signal: ac.signal,
         onMessage: (msg, meta) => {
           void storage.appendMessage({
             session_id: id, role: msg.role, content: msg.content,
@@ -83,12 +121,14 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       outcome.tokens = result.tokens;
       outcome.hops = result.hops;
       await storage.updateSession(id, { status: 'active', tokens_in: session.tokens_in + result.tokens.in, tokens_out: session.tokens_out + result.tokens.out });
+      activeTurns.delete(id);
       return { turn: outcome };
     } catch (err) {
       const e = err as { code?: string; message?: string };
       outcome.error = e.message ?? String(err);
       outcome.code = e.code ?? undefined;
       await storage.updateSession(id, { status: 'error' });
+      activeTurns.delete(id);
       return { turn: outcome }; // the turn failed; the REQUEST succeeded — outcome carries the verdict
     }
   });
