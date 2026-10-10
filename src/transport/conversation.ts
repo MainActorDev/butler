@@ -85,6 +85,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     if (!b.content?.trim()) return reply.code(400).send({ error: 'content required' });
     const session = await storage.getSession(id);
     if (!session) return reply.code(404).send({ error: 'session not found' });
+    if (activeTurns.has(id)) return reply.code(409).send({ error: 'turn already in flight on this session' });
 
     await storage.appendMessage({ session_id: id, role: 'user', content: b.content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
 
@@ -103,6 +104,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       const notesLines = notes.slice(0, 20).map((n) => `- [${n.kind} ${n.scope_key}] ${n.content} (source: ${n.source_ref})`).join('\n');
       const notesBlock = notes.length ? `\n\n## Known notes (provenance-stamped memory)\n${notesLines}` : '';
       const result = await runLoop(deps.systemPrompt + notesBlock, b.content, {
+        history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
         provider: deps.provider,
         tools: registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission)).map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),

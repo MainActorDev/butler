@@ -54,6 +54,8 @@ export interface LoopDeps {
   budget?: Partial<LoopBudget>;
   /** persistence hook — called after every message appended (rows land in Stage 2) */
   onMessage?: (msg: ProviderMessage, meta: { hop: number; tokensIn: number; tokensOut: number }) => void;
+  /** prior turns for multi-turn memory (user + textful assistant messages) */
+  history?: ProviderMessage[];
   /** event stream for transports (WS emission in Stage 4) */
   onEvent?: (e: TurnEvent) => void;
   signal?: AbortSignal;
@@ -66,7 +68,13 @@ function toolDefs(tools: LoopTool[]): ProviderTool[] {
 export async function runLoop(systemPrompt: string, userMessage: string, deps: LoopDeps): Promise<LoopResult> {
   const budget = { ...DEFAULT_BUDGET, ...deps.budget };
   const started = Date.now();
-  const messages: ProviderMessage[] = [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }];
+  // prior conversation (memory): injected between system and the fresh user
+  // message so multi-turn sessions keep context. Callers cap it.
+  const messages: ProviderMessage[] = [
+    { role: 'system', content: systemPrompt },
+    ...(deps.history ?? []),
+    { role: 'user', content: userMessage },
+  ];
   const tokens = { in: 0, out: 0 };
   let repairs = 0;
 
