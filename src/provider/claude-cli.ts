@@ -100,7 +100,10 @@ export class ClaudeCliProvider implements Provider {
         setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 2_000);
         void why;
       };
-      const timer = setTimeout(() => shutdown('timeout'), Math.min(this.cfg.timeoutMs ?? 120_000, Math.max(1, opts.remainingMs)));
+      // claude-cli is a HARNESS: one complete() spans its whole internal tool loop —
+      // agentic turns routinely exceed 2min. Default 10min (matches the loop's wall
+      // budget); the loop still clamps via remainingMs.
+      const timer = setTimeout(() => shutdown('timeout'), Math.min(this.cfg.timeoutMs ?? 600_000, Math.max(1, opts.remainingMs)));
 
       child.stdout?.on('data', (chunk: Buffer) => {
         buf += chunk.toString();
