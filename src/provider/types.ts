@@ -63,7 +63,7 @@ export interface Provider {
   complete(
     messages: ProviderMessage[],
     tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: ((delta: string) => void) | undefined },
   ): Promise<ProviderResponse>;
   readonly model: string;
 }

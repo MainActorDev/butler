@@ -19,6 +19,8 @@ export interface ConversationDeps {
   budget?: { maxHops?: number; maxTokens?: number; wallMs?: number };
   /** consumer's event sink (WS bus in the demo; anything callable) */
   emit(event: TurnEvent & { sessionId: string }): void;
+  /** streaming seam: per-session delta handler factory */
+  onDelta?: (sessionId: string) => (delta: string) => void;
 }
 
 export interface TurnOutcome {
@@ -109,6 +111,8 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         tools: registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission)).map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),
         signal: ac.signal,
+        // rev10: live token stream → transport events (WS bridge streams UI)
+        ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
         onMessage: (msg, meta) => {
           void storage.appendMessage({
             session_id: id, role: msg.role, content: msg.content,

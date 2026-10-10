@@ -41,7 +41,7 @@ export class OpenAICompatProvider implements Provider {
   async complete(
     messages: ProviderMessage[],
     tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal },
+    opts: { remainingMs: number; signal?: AbortSignal; onDelta?: (delta: string) => void },
   ): Promise<ProviderResponse> {
     const deadline = Date.now() + Math.max(0, opts.remainingMs);
     let attempt = 0;
@@ -61,6 +61,7 @@ export class OpenAICompatProvider implements Provider {
           headers: { 'content-type': 'application/json', authorization: `Bearer ${this.cfg.apiKey}` },
           body: JSON.stringify({
             model: this.model,
+            ...(opts.onDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
             messages: messages.map((m) => ({
               role: m.role,
               ...(m.content !== undefined ? { content: m.content } : {}),
@@ -74,6 +75,55 @@ export class OpenAICompatProvider implements Provider {
           signal: callSignal,
         });
 
+        if (res.ok && opts.onDelta && res.body) {
+          // SSE stream: data: {...} lines, [DONE] terminator; delta.content
+          // chunks flow to onDelta live; tool-call fragments accumulate.
+          let content = '';
+          const toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> = [];
+          let finishReason: string | null = null;
+          let usage: { promptTokens: number; completionTokens: number } | null = null;
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = '';
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop() ?? '';
+            for (const line of lines) {
+              const t = line.trim();
+              if (!t.startsWith('data:')) continue;
+              const payload = t.slice(5).trim();
+              if (payload === '[DONE]') continue;
+              try {
+                const j = JSON.parse(payload) as {
+                  choices?: Array<{ delta?: { content?: string | null; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }; finish_reason?: string | null }>;
+                  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+                };
+                const ch = j.choices?.[0];
+                if (ch?.finish_reason) finishReason = ch.finish_reason;
+                if (j.usage) usage = { promptTokens: j.usage.prompt_tokens ?? 0, completionTokens: j.usage.completion_tokens ?? 0 };
+                const d = ch?.delta?.content;
+                if (d) { content += d; opts.onDelta(d); }
+                for (const tc of ch?.delta?.tool_calls ?? []) {
+                  const slot = toolCalls[tc.index] ?? { id: '', type: 'function' as const, function: { name: '', arguments: '' } };
+                  slot.id = tc.id ?? slot.id;
+                  slot.function.name += tc.function?.name ?? '';
+                  slot.function.arguments += tc.function?.arguments ?? '';
+                  toolCalls[tc.index] = slot;
+                }
+              } catch { /* partial json — a later chunk completes it */ }
+            }
+          }
+          if (!content && toolCalls.length === 0) throw new ProviderError('provider streamed no content', 'PROVIDER_UNAVAILABLE', res.status, false);
+          this.onEvent?.({ type: 'provider.response', attempt, promptTokens: usage?.promptTokens ?? 0, completionTokens: usage?.completionTokens ?? 0 });
+          return {
+            message: { role: 'assistant', content: content || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+            finishReason,
+            usage,
+          };
+        }
         if (res.ok) {
           const body = (await res.json()) as ChatCompletionResponse;
           const choice = body.choices?.[0];
