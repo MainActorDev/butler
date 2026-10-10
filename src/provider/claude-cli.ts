@@ -55,7 +55,7 @@ export class ClaudeCliProvider implements Provider {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     const args: string[] = ['-p', '--bare',
       '--output-format', 'stream-json',
-      '--permission-prompts', 'none',
+      '--permission-mode', 'bypassPermissions',
       '--allowedTools', ...this.allowedTools(),
     ];
     if (this.sessionId) args.push('--resume', this.sessionId);
