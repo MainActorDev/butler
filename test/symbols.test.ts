@@ -83,3 +83,18 @@ describe('repo connector symbols opt-in', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('repoConnector skipDirs (consumer-level walk budget)', () => {
+  it('skips the declared directories beyond the builtins', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'butler-skipdirs-'));
+    writeFileSync(join(dir, 'keep.ts'), 'export const a = 1;\n');
+    mkdirSync(join(dir, 'repos'));
+    writeFileSync(join(dir, 'repos', 'foreign.swift'), 'class Foreign {}\n');
+    const c = repoConnector('t-skip', { origin: dir, skipDirs: ['repos'] });
+    const docs = await c.fetch();
+    const names = docs.map((d) => `${d.uri} ${d.content ?? ''}`).join(' ');
+    expect(names).toContain('a = 1');
+    expect(names).not.toContain('Foreign');
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
