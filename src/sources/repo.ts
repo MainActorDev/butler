@@ -22,15 +22,20 @@ export interface RepoSourceConfig {
   treeDoc?: boolean;
   /** emit symbol chunks for TS/JS-family files (plan Stage G) */
   symbols?: boolean;
+  /** ADDITIONAL directory names to skip (consumer-level: workspace clones,
+   *  artifact dirs — anything that would eat the walk budget or pollute
+   *  context with foreign source). Unioned with the builtin SKIP_DIRS. */
+  skipDirs?: string[];
 }
 
-function listRepoFiles(root: string, maxFiles: number, maxBytes: number): string[] {
+function listRepoFiles(root: string, maxFiles: number, maxBytes: number, skipDirs?: string[]): string[] {
+  const skip = skipDirs?.length ? new Set([...SKIP_DIRS, ...skipDirs]) : SKIP_DIRS;
   const out: string[] = [];
   const walk = (dir: string): void => {
     if (out.length >= maxFiles) return;
     for (const entry of readdirSync(dir).sort()) {
       if (out.length >= maxFiles) break;
-      if (SKIP_DIRS.has(entry)) continue;
+      if (skip.has(entry)) continue;
       const p = join(dir, entry);
       const st = statSync(p);
       if (st.isDirectory()) { walk(p); continue; }
@@ -59,7 +64,7 @@ export function repoConnector(sourceId: string, cfg: RepoSourceConfig): SourceCo
         root = tmpClone;
       }
       try {
-        const files = listRepoFiles(root, maxFiles, maxBytes);
+        const files = listRepoFiles(root, maxFiles, maxBytes, cfg.skipDirs);
         const out: NormalizedDocument[] = [];
         if (cfg.treeDoc !== false) {
           const tree = files.map((f) => relative(root, f)).join('\n');
