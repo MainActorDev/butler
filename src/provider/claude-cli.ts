@@ -54,7 +54,7 @@ export class ClaudeCliProvider implements Provider {
   ): Promise<ProviderResponse> {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     const args: string[] = ['-p', '--bare',
-      '--output-format', 'stream-json',
+      '--output-format', 'stream-json', '--verbose',
       '--permission-mode', 'bypassPermissions',
       '--allowedTools', ...this.allowedTools(),
     ];
