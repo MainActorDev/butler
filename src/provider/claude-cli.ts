@@ -158,6 +158,6 @@ export class ClaudeCliProvider implements Provider {
   }
 }
 
-export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act' }): Provider {
+export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string> }): Provider {
   return new ClaudeCliProvider(cfg);
 }
