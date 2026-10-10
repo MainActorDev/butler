@@ -34,7 +34,7 @@ export interface LoopTool {
 }
 
 export interface TurnEvent {
-  type: 'turn.start' | 'provider.response' | 'tool.call' | 'tool.result' | 'turn.end' | 'turn.error';
+  type: 'turn.start' | 'provider.response' | 'tool.call' | 'tool.result' | 'turn.end' | 'turn.error' | 'turn.delta';
   hop: number;
   detail?: unknown;
 }
@@ -58,6 +58,8 @@ export interface LoopDeps {
   history?: ProviderMessage[];
   /** event stream for transports (WS emission in Stage 4) */
   onEvent?: (e: TurnEvent) => void;
+  /** live token stream — called per provider delta (streaming UI) */
+  onDelta?: (delta: string) => void;
   signal?: AbortSignal;
 }
 
@@ -89,7 +91,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     const wallSignal = AbortSignal.any([AbortSignal.timeout(remainingMs), ...(deps.signal ? [deps.signal] : [])]);
     let res;
     try {
-      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal });
+      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.onDelta ? { onDelta: (d: string) => { deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); } } : {}) });
     } catch (err) {
       // caller abort vs wall timeout: AbortSignal.timeout raises TimeoutError;
       // a caller signal abort propagates AbortError (or a custom reason)
