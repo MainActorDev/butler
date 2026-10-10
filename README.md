@@ -7,7 +7,7 @@
 <p align="center"><strong>The reusable agent runtime. Your tools, your policy — his service.</strong></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-61%20passing-brightgreen" alt="tests" />
+  <img src="https://img.shields.io/badge/tests-110%20passing-brightgreen" alt="tests" />
   <img src="https://img.shields.io/badge/node-24.12-blue" alt="node" />
   <img src="https://img.shields.io/badge/provider-OpenAI--compatible-blueviolet" alt="provider" />
   <img src="https://img.shields.io/badge/surfaces-conversation%20API%20%C2%B7%20MCP-teal" alt="surfaces" />
@@ -163,6 +163,8 @@ Serves the demo registry over stdio (fixtures corpus, draft policy —
 one tool set, every surface.
 
 ## Docs map
+
+- `docs/agent-core.md` — P1 agent core: profiles, workflows, artifacts, claude-cli executor
 
 | Doc | What's in it |
 |---|---|

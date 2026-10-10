@@ -3,7 +3,7 @@
 import Database from 'better-sqlite3';
 import { randomUUID, createHash } from 'node:crypto';
 import type {
-  ChunkRow, DocumentRow, MessageRow, NewSession, NoteRow, SessionRow, SourceRow, Storage,
+  ArtifactRow, ChunkRow, DocumentRow, MessageRow, NewSession, NoteRow, SessionRow, SourceRow, Storage,
 } from './contract.ts';
 
 const MIGRATIONS = `
@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS butler_notes(
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   superseded_by TEXT,
-  superseded_at INTEGER
+  superseded_at INTEGER,
+  superseded_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS butler_notes_scope ON butler_notes(scope_key);
 
@@ -77,6 +78,22 @@ CREATE TABLE IF NOT EXISTS butler_document_chunks(
   tokens INTEGER NOT NULL,
   UNIQUE(doc_sha256, ordinal)
 );
+
+CREATE TABLE IF NOT EXISTS butler_artifacts(
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  session_id TEXT,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  provenance_json TEXT,
+  superseded_by TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(kind, name, version)
+);
+CREATE INDEX IF NOT EXISTS butler_artifacts_kind_name ON butler_artifacts(kind, name);
+CREATE INDEX IF NOT EXISTS butler_artifacts_run ON butler_artifacts(run_id);
 `;
 
 export class SqliteStorage implements Storage {
@@ -95,6 +112,10 @@ export class SqliteStorage implements Storage {
 
   private migrate(): void {
     this.db.exec(MIGRATIONS);
+    // P1 D6c guarded migration: pre-existing DBs created butler_notes without
+    // superseded_reason; SQLite has no ADD COLUMN IF NOT EXISTS — a duplicate
+    // column error means the column is already present, which is success.
+    try { this.db.exec('ALTER TABLE butler_notes ADD COLUMN superseded_reason TEXT'); } catch { /* already there */ }
   }
 
   close(): void { this.db.close(); }
@@ -142,13 +163,13 @@ export class SqliteStorage implements Storage {
     return this.db.prepare('SELECT * FROM butler_messages WHERE session_id = ? ORDER BY rowid').all(sessionId) as MessageRow[];
   }
 
-  async insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at'>): Promise<NoteRow> {
+  async insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at' | 'superseded_reason'>): Promise<NoteRow> {
     if (!n.source_ref || !n.source_ref.trim()) throw new Error('note provenance is mandatory: source_ref required (no ref, no note)');
     const id = `note_${randomUUID().slice(0, 12)}`;
     const created = Date.now();
     this.db.prepare('INSERT INTO butler_notes(id, scope_key, kind, content, source_type, source_ref, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)')
       .run(id, n.scope_key, n.kind, n.content, n.source_type, n.source_ref, n.created_by, created);
-    return { ...n, id, created_at: created, superseded_by: null, superseded_at: null };
+    return { ...n, id, created_at: created, superseded_by: null, superseded_at: null, superseded_reason: null };
   }
 
   async activeNotes(scopeKeyPrefix?: string): Promise<NoteRow[]> {
@@ -158,13 +179,43 @@ export class SqliteStorage implements Storage {
     return this.db.prepare('SELECT * FROM butler_notes WHERE superseded_by IS NULL AND scope_key LIKE ? ORDER BY created_at DESC').all(`${scopeKeyPrefix}%`) as NoteRow[];
   }
 
-  async supersedeNote(id: string, byId: string, at: number): Promise<void> {
-    const r = this.db.prepare('UPDATE butler_notes SET superseded_by = ?, superseded_at = ? WHERE id = ? AND superseded_by IS NULL').run(byId, at, id);
+  async supersedeNote(id: string, byId: string, at: number, reason?: 'refuted' | 'refined' | 'superseded'): Promise<void> {
+    const r = this.db.prepare('UPDATE butler_notes SET superseded_by = ?, superseded_at = ?, superseded_reason = ? WHERE id = ? AND superseded_by IS NULL').run(byId, at, reason ?? null, id);
     if (r.changes === 0) throw new Error(`note ${id} not found or already superseded`);
   }
 
   async getNote(id: string): Promise<NoteRow | null> {
     return (this.db.prepare('SELECT * FROM butler_notes WHERE id = ?').get(id) as NoteRow | undefined) ?? null;
+  }
+
+  // ── artifacts (P1 C3): versioned per (kind,name); append-only chain ──
+  async saveArtifact(a: Omit<ArtifactRow, 'id' | 'version' | 'superseded_by' | 'created_at'>): Promise<ArtifactRow> {
+    const prev = this.db.prepare('SELECT id, version FROM butler_artifacts WHERE kind = ? AND name = ? ORDER BY version DESC LIMIT 1').get(a.kind, a.name) as { id: string; version: number } | undefined;
+    const version = (prev?.version ?? 0) + 1;
+    const id = `art_${createHash('sha256').update(`${a.kind}:${a.name}:${version}:${Date.now()}:${randomUUID()}`).digest('hex').slice(0, 12)}`;
+    const created_at = Date.now();
+    this.db.prepare('INSERT INTO butler_artifacts(id, run_id, session_id, kind, name, version, body, provenance_json, superseded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)')
+      .run(id, a.run_id, a.session_id, a.kind, a.name, version, a.body, a.provenance_json, created_at);
+    if (prev) this.db.prepare('UPDATE butler_artifacts SET superseded_by = ? WHERE id = ?').run(id, prev.id);
+    return { ...a, id, version, superseded_by: null, created_at };
+  }
+
+  async getArtifact(id: string): Promise<ArtifactRow | null> {
+    return (this.db.prepare('SELECT * FROM butler_artifacts WHERE id = ?').get(id) as ArtifactRow | undefined) ?? null;
+  }
+
+  async latestArtifact(kind: string, name: string): Promise<ArtifactRow | null> {
+    return (this.db.prepare('SELECT * FROM butler_artifacts WHERE kind = ? AND name = ? AND superseded_by IS NULL ORDER BY version DESC LIMIT 1').get(kind, name) as ArtifactRow | undefined) ?? null;
+  }
+
+  async listArtifacts(filter?: { kind?: string; runId?: string; name?: string }): Promise<ArtifactRow[]> {
+    const conds: string[] = [];
+    const args: unknown[] = [];
+    if (filter?.kind) { conds.push('kind = ?'); args.push(filter.kind); }
+    if (filter?.runId) { conds.push('run_id = ?'); args.push(filter.runId); }
+    if (filter?.name) { conds.push('name = ?'); args.push(filter.name); }
+    const where = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
+    return this.db.prepare(`SELECT * FROM butler_artifacts${where} ORDER BY created_at DESC`).all(...args) as ArtifactRow[];
   }
 
   async upsertSource(s: Omit<SourceRow, 'created_at'>): Promise<SourceRow> {

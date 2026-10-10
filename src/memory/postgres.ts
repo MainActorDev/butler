@@ -6,6 +6,7 @@
 import { Pool, type PoolClient } from 'pg';
 import { randomUUID, createHash } from 'node:crypto';
 import type {
+  ArtifactRow,
   ChunkRow, DocumentRow, MessageRow, NewSession, NoteRow, SessionRow, SourceRow, Storage,
 } from './contract.ts';
 
@@ -47,9 +48,11 @@ CREATE TABLE IF NOT EXISTS butler_notes(
   created_by TEXT NOT NULL,
   created_at BIGINT NOT NULL,
   superseded_by TEXT,
-  superseded_at BIGINT
+  superseded_at BIGINT,
+  superseded_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS butler_notes_scope ON butler_notes(scope_key);
+ALTER TABLE butler_notes ADD COLUMN IF NOT EXISTS superseded_reason TEXT;
 
 CREATE TABLE IF NOT EXISTS butler_sources(
   id TEXT PRIMARY KEY,
@@ -80,6 +83,22 @@ CREATE TABLE IF NOT EXISTS butler_document_chunks(
   tokens INTEGER NOT NULL,
   UNIQUE(doc_sha256, ordinal)
 );
+
+CREATE TABLE IF NOT EXISTS butler_artifacts(
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  session_id TEXT,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  provenance_json TEXT,
+  superseded_by TEXT,
+  created_at BIGINT NOT NULL,
+  UNIQUE(kind, name, version)
+);
+CREATE INDEX IF NOT EXISTS butler_artifacts_kind_name ON butler_artifacts(kind, name);
+CREATE INDEX IF NOT EXISTS butler_artifacts_run ON butler_artifacts(run_id);
 `;
 
 export class PostgresStorage implements Storage {
@@ -182,7 +201,7 @@ export class PostgresStorage implements Storage {
     }));
   }
 
-  async insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at'>): Promise<NoteRow> {
+  async insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at' | 'superseded_reason'>): Promise<NoteRow> {
     if (!n.source_ref || !n.source_ref.trim()) throw new Error('note provenance is mandatory: source_ref required (no ref, no note)');
     const id = `note_${randomUUID().slice(0, 12)}`;
     const created = Date.now();
@@ -190,7 +209,7 @@ export class PostgresStorage implements Storage {
       'INSERT INTO butler_notes(id, scope_key, kind, content, source_type, source_ref, created_by, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [id, n.scope_key, n.kind, n.content, n.source_type, n.source_ref, n.created_by, created],
     );
-    return { ...n, id, created_at: created, superseded_by: null, superseded_at: null };
+    return { ...n, id, created_at: created, superseded_by: null, superseded_at: null, superseded_reason: null };
   }
 
   private rowToNote(x: Record<string, unknown>): NoteRow {
@@ -200,7 +219,8 @@ export class PostgresStorage implements Storage {
       created_by: String(x['created_by']), created_at: Number(x['created_at']),
       superseded_by: x['superseded_by'] === null ? null : String(x['superseded_by']),
       superseded_at: x['superseded_at'] === null ? null : Number(x['superseded_at']),
-    };
+      ...(x['superseded_reason'] !== null && x['superseded_reason'] !== undefined ? { superseded_reason: String(x['superseded_reason']) } : {}),
+    } as NoteRow;
   }
 
   async activeNotes(scopeKeyPrefix?: string): Promise<NoteRow[]> {
@@ -210,14 +230,60 @@ export class PostgresStorage implements Storage {
     return r.rows.map((x) => this.rowToNote(x));
   }
 
-  async supersedeNote(id: string, byId: string, at: number): Promise<void> {
-    const r = await this.pool.query('UPDATE butler_notes SET superseded_by=$1, superseded_at=$2 WHERE id=$3 AND superseded_by IS NULL', [byId, at, id]);
+  async supersedeNote(id: string, byId: string, at: number, reason?: 'refuted' | 'refined' | 'superseded'): Promise<void> {
+    const r = await this.pool.query('UPDATE butler_notes SET superseded_by=$1, superseded_at=$2, superseded_reason=$3 WHERE id=$4 AND superseded_by IS NULL', [byId, at, reason ?? null, id]);
     if (r.rowCount === 0) throw new Error(`note ${id} not found or already superseded`);
   }
 
   async getNote(id: string): Promise<NoteRow | null> {
     const r = await this.pool.query('SELECT * FROM butler_notes WHERE id = $1', [id]);
     return r.rows[0] ? this.rowToNote(r.rows[0]) : null;
+  }
+
+  // ── artifacts (P1 C3) ──
+  async saveArtifact(a: Omit<ArtifactRow, 'id' | 'version' | 'superseded_by' | 'created_at'>): Promise<ArtifactRow> {
+    const prev = await this.pool.query('SELECT id, version FROM butler_artifacts WHERE kind=$1 AND name=$2 ORDER BY version DESC LIMIT 1', [a.kind, a.name]);
+    const version = (prev.rows[0]?.['version'] ? Number(prev.rows[0]['version']) : 0) + 1;
+    const id = `art_${createHash('sha256').update(`${a.kind}:${a.name}:${version}:${Date.now()}:${randomUUID()}`).digest('hex').slice(0, 12)}`;
+    const created_at = Date.now();
+    await this.pool.query('INSERT INTO butler_artifacts(id, run_id, session_id, kind, name, version, body, provenance_json, superseded_by, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9)',
+      [id, a.run_id, a.session_id, a.kind, a.name, version, a.body, a.provenance_json, created_at]);
+    if (prev.rows[0]) await this.pool.query('UPDATE butler_artifacts SET superseded_by=$1 WHERE id=$2', [id, prev.rows[0]['id']]);
+    return { ...a, id, version, superseded_by: null, created_at };
+  }
+
+  async getArtifact(id: string): Promise<ArtifactRow | null> {
+    const r = await this.pool.query('SELECT * FROM butler_artifacts WHERE id = $1', [id]);
+    return r.rows[0] ? this.rowToArtifact(r.rows[0]) : null;
+  }
+
+  async latestArtifact(kind: string, name: string): Promise<ArtifactRow | null> {
+    const r = await this.pool.query('SELECT * FROM butler_artifacts WHERE kind=$1 AND name=$2 AND superseded_by IS NULL ORDER BY version DESC LIMIT 1', [kind, name]);
+    return r.rows[0] ? this.rowToArtifact(r.rows[0]) : null;
+  }
+
+  async listArtifacts(filter?: { kind?: string; runId?: string; name?: string }): Promise<ArtifactRow[]> {
+    const conds: string[] = [];
+    const args: unknown[] = [];
+    if (filter?.kind) { conds.push(`kind=$${args.length + 1}`); args.push(filter.kind); }
+    if (filter?.runId) { conds.push(`run_id=$${args.length + 1}`); args.push(filter.runId); }
+    if (filter?.name) { conds.push(`name=$${args.length + 1}`); args.push(filter.name); }
+    const where = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
+    const r = await this.pool.query(`SELECT * FROM butler_artifacts${where} ORDER BY created_at DESC`, args);
+    return r.rows.map((x) => this.rowToArtifact(x));
+  }
+
+  private rowToArtifact(x: Record<string, unknown>): ArtifactRow {
+    return {
+      id: String(x['id']),
+      run_id: x['run_id'] === null || x['run_id'] === undefined ? null : String(x['run_id']),
+      session_id: x['session_id'] === null || x['session_id'] === undefined ? null : String(x['session_id']),
+      kind: String(x['kind']), name: String(x['name']), version: Number(x['version']),
+      body: String(x['body']),
+      provenance_json: x['provenance_json'] === null || x['provenance_json'] === undefined ? null : String(x['provenance_json']),
+      superseded_by: x['superseded_by'] === null || x['superseded_by'] === undefined ? null : String(x['superseded_by']),
+      created_at: Number(x['created_at']),
+    };
   }
 
   async upsertSource(s: Omit<SourceRow, 'created_at'>): Promise<SourceRow> {
