@@ -24,7 +24,7 @@ export interface ClaudeCliEvent {
   session_id?: string;
   result?: string;
   tool_use_id?: string;
-  message?: { content?: Array<{ type: string; text?: string }> };
+  message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> };
   error?: string;
 }
 
@@ -33,7 +33,7 @@ export class ClaudeCliProvider implements Provider {
   private sessionId: string | null = null;
   private child: ChildProcess | null = null;
 
-  constructor(private cfg: ProviderConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act' }) {
+  constructor(private cfg: ProviderConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string> }) {
     this.model = cfg.model || 'claude-cli';
   }
 
@@ -50,7 +50,7 @@ export class ClaudeCliProvider implements Provider {
   async complete(
     messages: ProviderMessage[],
     _tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void },
   ): Promise<ProviderResponse> {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     const args: string[] = ['-p', '--bare',
@@ -68,12 +68,31 @@ export class ClaudeCliProvider implements Provider {
     const prompt = userTurn?.content ?? '';
 
     return new Promise<ProviderResponse>((resolve, reject) => {
-      const child = spawn(bin, [...args, prompt], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(bin, [...args, prompt], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // GLM-via-claude: inject the Anthropic-protocol endpoint vars for THIS
+        // subprocess only — never touches the host's ~/.claude/settings.json
+        ...(this.cfg.env ? { env: { ...process.env, ...this.cfg.env } } : {}),
+      });
       this.child = child;
-      let stdout = '';
+      let buf = '';
       let stderr = '';
       const events: ClaudeCliEvent[] = [];
       let settled = false;
+      const onLine = (line: string): void => {
+        const t = line.trim();
+        if (!t) return;
+        let ev: ClaudeCliEvent;
+        try { ev = JSON.parse(t) as ClaudeCliEvent; } catch { return; }
+        events.push(ev);
+        // live forwarding: text deltas stream; tool_use announces with name+input
+        if (ev.type === 'assistant' && ev.message?.content) {
+          for (const blk of ev.message.content) {
+            if (blk.type === 'text' && blk.text) opts.onDelta?.(blk.text);
+            if (blk.type === 'tool_use') opts.onDelta?.(`\n⌁ ${blk.name ?? 'tool'}…\n`);
+          }
+        }
+      };
 
       const shutdown = (why: string): void => {
         if (child.exitCode !== null || child.signalCode !== null) return;
@@ -83,7 +102,12 @@ export class ClaudeCliProvider implements Provider {
       };
       const timer = setTimeout(() => shutdown('timeout'), Math.min(this.cfg.timeoutMs ?? 120_000, Math.max(1, opts.remainingMs)));
 
-      child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.stdout?.on('data', (chunk: Buffer) => {
+        buf += chunk.toString();
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const l of lines) onLine(l);
+      });
       child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
       child.on('error', (err) => {
         if (settled) return; settled = true;
@@ -93,11 +117,7 @@ export class ClaudeCliProvider implements Provider {
       child.on('close', (code) => {
         clearTimeout(timer);
         if (settled) return; settled = true;
-        for (const line of stdout.split('\n')) {
-          const t = line.trim();
-          if (!t) continue;
-          try { events.push(JSON.parse(t) as ClaudeCliEvent); } catch { /* partial line at kill */ }
-        }
+        if (buf.trim()) onLine(buf); // final unterminated line
         const init = events.find((e) => e.type === 'system' && e.session_id);
         if (init?.session_id) this.sessionId = init.session_id;
         const result = events.find((e) => e.type === 'result');
