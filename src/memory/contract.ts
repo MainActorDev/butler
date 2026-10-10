@@ -41,6 +41,8 @@ export interface NoteRow {
   created_at: number;
   superseded_by: string | null;
   superseded_at: number | null;
+  /** P1 D6c: why the note was superseded — contradictions are FLAGGED, not silently dropped. Read-path only. */
+  superseded_reason?: 'refuted' | 'refined' | 'superseded' | null;
 }
 
 export interface SourceRow {
@@ -73,6 +75,20 @@ export interface ChunkRow {
   tokens: number;
 }
 
+/** P1 C3: durable pipeline outputs — versioned, append-only, provenance-carrying. */
+export interface ArtifactRow {
+  id: string;
+  run_id: string | null;
+  session_id: string | null;
+  kind: string;              // 'knowledge' | 'scope' | 'breakdown' | 'a11y-report' | …
+  name: string;              // stable per-entity page name, e.g. 'app:com.foo'
+  version: number;           // 1-based, monotonic per (kind, name)
+  body: string;              // markdown
+  provenance_json: string | null; // refs/sources the body integrates
+  superseded_by: string | null;   // append-only chain like notes
+  created_at: number;
+}
+
 export interface NewSession {
   id: string;
   parent_session_id?: string | null;
@@ -95,10 +111,16 @@ export interface Storage {
   sessionMessages(sessionId: string): Promise<MessageRow[]>;
 
   // notes (explicit-write only; supersession, never delete)
-  insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at'>): Promise<NoteRow>;
+  insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at' | 'superseded_reason'>): Promise<NoteRow>;
   activeNotes(scopeKeyPrefix?: string): Promise<NoteRow[]>;
-  supersedeNote(id: string, byId: string, at: number): Promise<void>;
+  supersedeNote(id: string, byId: string, at: number, reason?: 'refuted' | 'refined' | 'superseded'): Promise<void>;
   getNote(id: string): Promise<NoteRow | null>;
+
+  // artifacts (P1 C3 — versioned, append-only, per-entity knowledge pages)
+  saveArtifact(a: Omit<ArtifactRow, 'id' | 'version' | 'superseded_by' | 'created_at'>): Promise<ArtifactRow>;
+  getArtifact(id: string): Promise<ArtifactRow | null>;
+  latestArtifact(kind: string, name: string): Promise<ArtifactRow | null>;
+  listArtifacts(filter?: { kind?: string; runId?: string; name?: string }): Promise<ArtifactRow[]>;
 
   // sources + documents + chunks (Stage 3 fills the connectors; rows now)
   upsertSource(s: Omit<SourceRow, 'created_at'>): Promise<SourceRow>;

@@ -47,6 +47,35 @@ function contractSuite(name: string, make: () => Promise<Storage>, skip?: boolea
       const old = await s.getNote(n1.id);
       expect(old!.superseded_by).toBe(n2.id);
       await expect(s.supersedeNote(n1.id, n2.id, 456)).rejects.toThrow(/already superseded/);
+      // P1 C2b: supersession with a REASON (contradiction state — refuted/refined/superseded)
+      const n3 = await s.insertNote({ scope_key: 'app:x/y', kind: 'pitfall', content: 'v3', source_type: 'run', source_ref: 'run_3', created_by: 't' });
+      await s.supersedeNote(n2.id, n3.id, 789, 'refuted');
+      const refuted = await s.getNote(n2.id);
+      expect(refuted!.superseded_reason).toBe('refuted');
+      // unreasoned supersession stays valid (back-compat rows)
+      const n4 = await s.insertNote({ scope_key: 'app:x/y', kind: 'pitfall', content: 'v4', source_type: 'run', source_ref: 'run_4', created_by: 't' });
+      await s.supersedeNote(n3.id, n4.id, 790);
+      expect((await s.getNote(n3.id))!.superseded_reason ?? null).toBe(null);
+
+      // P1 C3: artifacts — versioned, append-only, per (kind,name) chain
+      const a1 = await s.saveArtifact({ run_id: 'run_1', session_id: null, kind: 'knowledge', name: 'app:com.foo', body: '# v1 knowledge', provenance_json: '[]' });
+      expect(a1.version).toBe(1);
+      const a2 = await s.saveArtifact({ run_id: 'run_2', session_id: null, kind: 'knowledge', name: 'app:com.foo', body: '# v2 knowledge', provenance_json: '[]' });
+      expect(a2.version).toBe(2);
+      expect(a1.superseded_by).toBeNull(); expect(a2.superseded_by).toBeNull();
+      const latest = await s.latestArtifact('knowledge', 'app:com.foo');
+      expect(latest!.id).toBe(a2.id); expect(latest!.version).toBe(2);
+      // old version still readable (append-only)
+      expect((await s.getArtifact(a1.id))!.body).toBe('# v1 knowledge');
+      // v1 row now points forward
+      expect((await s.getArtifact(a1.id))!.superseded_by).toBe(a2.id);
+      // listing filters
+      expect((await s.listArtifacts({ kind: 'knowledge', runId: 'run_1' })).length).toBe(1);
+      expect((await s.listArtifacts({ name: 'app:com.foo' })).length).toBe(2);
+      expect((await s.listArtifacts({ kind: 'scope' })).length).toBe(0);
+      // separate names version independently
+      const b1 = await s.saveArtifact({ run_id: null, session_id: null, kind: 'scope', name: 'run_1/scope', body: 'scope', provenance_json: null });
+      expect(b1.version).toBe(1);
     });
 
     it('sources + documents + chunks: round-trip; re-ingest replaces chunks', async () => {

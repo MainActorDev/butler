@@ -1,6 +1,6 @@
 /** Butler — reusable agent runtime (plan 20261001T035356Z rev 3.1).
  *  v1 surface lands by stage; this barrel re-exports as modules arrive. */
-export const BUTLER_VERSION = '0.1.0';
+export const BUTLER_VERSION = '0.3.0';
 
 // Stage 1 — provider + loop
 export * from './provider/index.ts';
@@ -50,3 +50,14 @@ export type { ChildSpec, ChildReport, SupervisorDeps } from './orchestrate/super
 // Stage 5 — eval harness
 export { evalRetrieval, evalBudget, evalAuthoring } from './eval.ts';
 export type { EvalResult, EvalCase, RetrievalEvalInput, BudgetEvalInput, AuthoringEvalInput } from './eval.ts';
+
+// ── P1 agent core: profiles, workflows, artifacts, claude-cli executor ──
+export { ProfileError, resolveProfile, providerFromConfig, notesBlockFor, scopeMatches } from './profile/profile.ts';
+export type { AgentProfile, ExecutorConfig, ExecutorKind, ResolvedProfile } from './profile/profile.ts';
+export { runWorkflow, answerWorkflow, WorkflowError, SqliteWorkflowStorage } from './workflow/run.ts';
+export type { WorkflowDeps, RunOutcome } from './workflow/run.ts';
+export type { WorkflowSpec, StageSpec, StageResult, QuestionPayload, WorkflowRunRow, WorkflowStageRow, WorkflowStorage, Validator } from './workflow/spec.ts';
+export { isQuestionPayload } from './workflow/spec.ts';
+export type { ArtifactRow } from './memory/contract.ts';
+export { claudeCliProvider, ClaudeCliProvider } from './provider/claude-cli.ts';
+export type { ClaudeCliEvent } from './provider/claude-cli.ts';
