@@ -48,7 +48,7 @@ export class ClaudeCliProvider implements Provider {
   private sessionId: string | null = null;
   private child: ChildProcess | null = null;
 
-  constructor(private cfg: ProviderConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string> }) {
+  constructor(private cfg: ProviderConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string>; mcpConfigPath?: string }) {
     this.model = cfg.model || 'claude-cli';
   }
 
@@ -73,6 +73,10 @@ export class ClaudeCliProvider implements Provider {
       '--permission-mode', 'bypassPermissions',
       '--allowedTools', ...this.allowedTools(),
     ];
+    // MCP mount (Lionidas tools as REAL registry tools — policy-gated, audited —
+    // instead of the model shelling out with Bash/sqlite3)
+    const mcp = (this.cfg as { mcpConfigPath?: string }).mcpConfigPath;
+    if (mcp) args.push('--mcp-config', mcp);
     if (this.sessionId) args.push('--resume', this.sessionId);
 
     // conversation → a single prompt (claude -p is turn-based; the system
@@ -194,6 +198,6 @@ export class ClaudeCliProvider implements Provider {
   }
 }
 
-export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string> }): Provider {
+export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string>; mcpConfigPath?: string }): Provider {
   return new ClaudeCliProvider(cfg);
 }
