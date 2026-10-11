@@ -60,8 +60,11 @@ export class ClaudeCliProvider implements Provider {
     // rev16: filesystem access is READ-ONLY at the harness level. Drafting
     // flows through the Lionidas registry tools (case.draft.* etc.) which
     // persist via the server, never by editing files in place.
+    // rev17c: the MCP server tools are ALLOWED by prefix — acceptEdits still
+    // prompts for anything not allowlisted (headless = denied). The deny-list
+    // remains the wall for Bash/Web/Task/Notebook.
     void this.cfg;
-    return ['Read', 'Grep', 'Glob', 'LS'];
+    return ['Read', 'Grep', 'Glob', 'LS', 'mcp__lionidas'];
   }
 
   async complete(
