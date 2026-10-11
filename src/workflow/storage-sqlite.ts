@@ -30,6 +30,34 @@ CREATE TABLE IF NOT EXISTS butler_workflow_stages(
 export class SqliteWorkflowStorage implements WorkflowStorage {
   constructor(private db: Database.Database) {
     this.db.exec(MIGRATIONS);
+    this.migrateGateStatus();
+  }
+
+  /** v0.4: existing installs carry the old CHECK constraint without
+   *  awaiting_gate. SQLite can't ALTER a CHECK — rebuild the table when the
+   *  old constraint is detected (data-preserving copy). */
+  private migrateGateStatus(): void {
+    const sql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='butler_workflow_runs'").get() as { sql: string } | undefined;
+    if (!sql?.sql || !sql.sql.includes('awaiting_gate')) {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.exec(`CREATE TABLE IF NOT EXISTS butler_workflow_runs_v2(
+          id TEXT PRIMARY KEY,
+          spec_id TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('running','awaiting_answer','awaiting_gate','done','failed')),
+          input_json TEXT NOT NULL,
+          current_stage TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL)`);
+        this.db.exec('INSERT INTO butler_workflow_runs_v2 SELECT id, spec_id, status, input_json, current_stage, created_at, updated_at FROM butler_workflow_runs');
+        this.db.exec('DROP TABLE butler_workflow_runs');
+        this.db.exec('ALTER TABLE butler_workflow_runs_v2 RENAME TO butler_workflow_runs');
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
+      }
+    }
   }
 
   async createWorkflowRun(row: Omit<WorkflowRunRow, 'created_at' | 'updated_at'>): Promise<WorkflowRunRow> {
