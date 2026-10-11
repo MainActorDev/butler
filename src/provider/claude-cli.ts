@@ -73,8 +73,12 @@ export class ClaudeCliProvider implements Provider {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     const args: string[] = ['-p', '--bare',
       '--output-format', 'stream-json', '--verbose',
-      '--permission-mode', 'bypassPermissions',
+      '--permission-mode', 'default',
       '--allowedTools', ...this.allowedTools(),
+      // HARD deny — allowedTools is only a hint; disallowedTools is the wall.
+      // No shell, no web, no sub-agents, no notebooks: all data flows through
+      // the policy-gated MCP registry.
+      '--disallowedTools', 'Bash', 'WebSearch', 'WebFetch', 'Task', 'NotebookEdit',
     ];
     // MCP mount (Lionidas tools as REAL registry tools — policy-gated, audited —
     // instead of the model shelling out with Bash/sqlite3)
