@@ -57,12 +57,11 @@ export class ClaudeCliProvider implements Provider {
     // rev15: Bash is NEVER granted — the Lionidas registry rides MCP and all
     // data access flows through policy-gated tools. Read/Grep/Glob stay for
     // the agent's own scratch context; file writes stay draft-class.
-    switch (this.cfg.policyClass ?? 'read') {
-      case 'read': return ['Read', 'Grep', 'Glob', 'LS'];
-      case 'draft': return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookEdit'];
-      case 'act': return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookEdit'];
-      default: return ['Read'];
-    }
+    // rev16: filesystem access is READ-ONLY at the harness level. Drafting
+    // flows through the Lionidas registry tools (case.draft.* etc.) which
+    // persist via the server, never by editing files in place.
+    void this.cfg;
+    return ['Read', 'Grep', 'Glob', 'LS'];
   }
 
   async complete(
