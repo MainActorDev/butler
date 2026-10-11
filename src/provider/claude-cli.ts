@@ -98,7 +98,9 @@ export class ClaudeCliProvider implements Provider {
       let stderr = '';
       const events: ClaudeCliEvent[] = [];
       let settled = false;
-      const onLine = (line: string): void => {
+      // correlate tool_results to calls by ORDER (result blocks carry no name)
+  const pendingCalls: string[] = [];
+  const onLine = (line: string): void => {
         const t = line.trim();
         if (!t) return;
         let ev: ClaudeCliEvent;
@@ -112,9 +114,11 @@ export class ClaudeCliProvider implements Provider {
             }
             if (blk.type === 'tool_use') {
               const sum = inputSummary(blk.input);
-              if (sum) opts.onTool?.({ phase: 'call', name: blk.name ?? 'tool', arg: sum });
-              else opts.onTool?.({ phase: 'call', name: blk.name ?? 'tool' });
-              opts.onDelta?.(`\n⏵ ${blk.name ?? 'tool'}${sum ? ` ${sum}` : ''}\n`);
+              const nm = blk.name ?? 'tool';
+              pendingCalls.push(nm);
+              if (sum) opts.onTool?.({ phase: 'call', name: nm, arg: sum });
+              else opts.onTool?.({ phase: 'call', name: nm });
+              opts.onDelta?.(`\n⏵ ${nm}${sum ? ` ${sum}` : ''}\n`);
             }
           }
         }
@@ -125,8 +129,9 @@ export class ClaudeCliProvider implements Provider {
               : Array.isArray(blk.content) ? (blk.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join(' ') : '';
             const head = text.trim().split('\n')[0] ?? '';
             if (head) {
-              if (blk.is_error) opts.onTool?.({ phase: 'result', name: blk.name ?? 'tool', result: head.slice(0, 160), isError: true });
-              else opts.onTool?.({ phase: 'result', name: blk.name ?? 'tool', result: head.slice(0, 160) });
+              const nm = pendingCalls.shift() ?? 'tool';
+              if (blk.is_error) opts.onTool?.({ phase: 'result', name: nm, result: head.slice(0, 160), isError: true });
+              else opts.onTool?.({ phase: 'result', name: nm, result: head.slice(0, 160) });
               opts.onDelta?.(`  ⎿ ${head.slice(0, 120)}\n`);
             }
           }
