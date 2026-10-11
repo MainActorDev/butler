@@ -65,7 +65,7 @@ export class ClaudeCliProvider implements Provider {
   async complete(
     messages: ProviderMessage[],
     _tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void },
   ): Promise<ProviderResponse> {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     const args: string[] = ['-p', '--bare',
@@ -112,6 +112,8 @@ export class ClaudeCliProvider implements Provider {
             }
             if (blk.type === 'tool_use') {
               const sum = inputSummary(blk.input);
+              if (sum) opts.onTool?.({ phase: 'call', name: blk.name ?? 'tool', arg: sum });
+              else opts.onTool?.({ phase: 'call', name: blk.name ?? 'tool' });
               opts.onDelta?.(`\n⏵ ${blk.name ?? 'tool'}${sum ? ` ${sum}` : ''}\n`);
             }
           }
@@ -122,7 +124,11 @@ export class ClaudeCliProvider implements Provider {
             const text = typeof blk.content === 'string' ? blk.content
               : Array.isArray(blk.content) ? (blk.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join(' ') : '';
             const head = text.trim().split('\n')[0] ?? '';
-            if (head) opts.onDelta?.(`  ⎿ ${head.slice(0, 120)}\n`);
+            if (head) {
+              if (blk.is_error) opts.onTool?.({ phase: 'result', name: blk.name ?? 'tool', result: head.slice(0, 160), isError: true });
+              else opts.onTool?.({ phase: 'result', name: blk.name ?? 'tool', result: head.slice(0, 160) });
+              opts.onDelta?.(`  ⎿ ${head.slice(0, 120)}\n`);
+            }
           }
         }
       };

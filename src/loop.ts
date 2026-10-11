@@ -34,7 +34,7 @@ export interface LoopTool {
 }
 
 export interface TurnEvent {
-  type: 'turn.start' | 'provider.response' | 'tool.call' | 'tool.result' | 'turn.end' | 'turn.error' | 'turn.delta';
+  type: 'turn.start' | 'provider.response' | 'tool.call' | 'tool.result' | 'turn.end' | 'turn.error' | 'turn.delta' | 'turn.tool';
   hop: number;
   detail?: unknown;
 }
@@ -60,6 +60,8 @@ export interface LoopDeps {
   onEvent?: (e: TurnEvent) => void;
   /** live token stream — called per provider delta (streaming UI) */
   onDelta?: (delta: string) => void;
+  /** structured tool events (claude-cli harness + registry loop) */
+  onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void;
   signal?: AbortSignal;
 }
 
@@ -93,7 +95,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     try {
       // streaming: the EVENT always flows (WS UIs); the direct callback stays
       // opt-in for hosts that want it without the event bus
-      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, onDelta: (d: string) => { deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); } });
+      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, onDelta: (d: string) => { deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => { deps.onTool?.(e); deps.onEvent?.({ type: 'turn.tool', hop, detail: e }); } });
     } catch (err) {
       // caller abort vs wall timeout: AbortSignal.timeout raises TimeoutError;
       // a caller signal abort propagates AbortError (or a custom reason)
