@@ -124,7 +124,6 @@ export class ClaudeCliProvider implements Provider {
               pendingCalls.push(nm);
               if (sum) opts.onTool?.({ phase: 'call', name: nm, arg: sum });
               else opts.onTool?.({ phase: 'call', name: nm });
-              opts.onDelta?.(`\n⏵ ${nm}${sum ? ` ${sum}` : ''}\n`);
             }
           }
         }
@@ -138,7 +137,6 @@ export class ClaudeCliProvider implements Provider {
               const nm = pendingCalls.shift() ?? 'tool';
               if (blk.is_error) opts.onTool?.({ phase: 'result', name: nm, result: head.slice(0, 160), isError: true });
               else opts.onTool?.({ phase: 'result', name: nm, result: head.slice(0, 160) });
-              opts.onDelta?.(`  ⎿ ${head.slice(0, 120)}\n`);
             }
           }
         }
