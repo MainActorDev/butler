@@ -54,10 +54,13 @@ export class ClaudeCliProvider implements Provider {
 
   /** map policy → claude tool allowlist (defense in depth; the registry is the real gate) */
   private allowedTools(): string[] {
+    // rev15: Bash is NEVER granted — the Lionidas registry rides MCP and all
+    // data access flows through policy-gated tools. Read/Grep/Glob stay for
+    // the agent's own scratch context; file writes stay draft-class.
     switch (this.cfg.policyClass ?? 'read') {
       case 'read': return ['Read', 'Grep', 'Glob', 'LS'];
       case 'draft': return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookEdit'];
-      case 'act': return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookEdit', 'Bash'];
+      case 'act': return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookEdit'];
       default: return ['Read'];
     }
   }
