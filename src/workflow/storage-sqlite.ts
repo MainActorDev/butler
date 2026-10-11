@@ -7,7 +7,7 @@ const MIGRATIONS = `
 CREATE TABLE IF NOT EXISTS butler_workflow_runs(
   id TEXT PRIMARY KEY,
   spec_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('running','awaiting_answer','done','failed')),
+  status TEXT NOT NULL CHECK(status IN ('running','awaiting_answer','awaiting_gate','done','failed')),
   input_json TEXT NOT NULL,
   current_stage TEXT,
   created_at INTEGER NOT NULL,

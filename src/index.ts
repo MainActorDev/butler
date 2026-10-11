@@ -54,7 +54,7 @@ export type { EvalResult, EvalCase, RetrievalEvalInput, BudgetEvalInput, Authori
 // ── P1 agent core: profiles, workflows, artifacts, claude-cli executor ──
 export { ProfileError, resolveProfile, providerFromConfig, notesBlockFor, scopeMatches } from './profile/profile.ts';
 export type { AgentProfile, ExecutorConfig, ExecutorKind, ResolvedProfile } from './profile/profile.ts';
-export { runWorkflow, answerWorkflow, WorkflowError, SqliteWorkflowStorage } from './workflow/run.ts';
+export { runWorkflow, answerWorkflow, WorkflowError, SqliteWorkflowStorage , advanceWorkflow } from './workflow/run.ts';
 export type { WorkflowDeps, RunOutcome } from './workflow/run.ts';
 export type { WorkflowSpec, StageSpec, StageResult, QuestionPayload, WorkflowRunRow, WorkflowStageRow, WorkflowStorage, Validator } from './workflow/spec.ts';
 export { isQuestionPayload } from './workflow/spec.ts';

@@ -169,11 +169,28 @@ export async function runWorkflow(
     await stage.onStageComplete?.({ stageId: stage.id, runId: run.id, ok: true, output, tokens: { in: result.tokens.in, out: result.tokens.out } });
 
     carry = stage.handoff ? stage.handoff(output) : output;
+
+    // manual handoff: a gated stage (not the last) parks the run for approval
+    const isLast = spec.stages[spec.stages.length - 1]?.id === stage.id;
+    if (stage.gated && !isLast) {
+      await deps.workflow.updateWorkflowRun(run.id, { status: 'awaiting_gate', current_stage: stage.id });
+      deps.emit?.({ type: 'workflow.stage_gate', runId: run.id, stageId: stage.id, detail: { nextStage: spec.stages[spec.stages.indexOf(stage) + 1]?.id ?? null } });
+      return finish(deps, run.id, spec.id, 'awaiting_gate');
+    }
   }
 
   await deps.workflow.updateWorkflowRun(run.id, { status: 'done', current_stage: null });
   deps.emit?.({ type: 'workflow.done', runId: run.id });
   return finish(deps, run.id, spec.id, 'done');
+}
+
+/** release a stage gate: the human approved the handoff to the next stage */
+export async function advanceWorkflow(deps: WorkflowDeps, runId: string): Promise<void> {
+  const run = await deps.workflow.getWorkflowRun(runId);
+  if (!run) throw new WorkflowError(`run ${runId} not found`);
+  if (run.status !== 'awaiting_gate') throw new WorkflowError(`run ${runId} is '${run.status}', not awaiting a gate`);
+  await deps.workflow.updateWorkflowRun(runId, { status: 'running' });
+  deps.emit?.({ type: 'workflow.gate_released', runId: runId });
 }
 
 /** record a human answer against a paused run; folds it into the stage payload */

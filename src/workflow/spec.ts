@@ -17,6 +17,10 @@ export interface StageSpec<I, O> {
   replanLimit?: number;
   /** stages that may pause on a question emit them via the question tool contract */
   pauseOnQuestion?: boolean;
+  /** gated stage: after it completes, the workflow HOLDS for human approval
+   *  before the next stage starts (manual handoff). The gate releases via
+   *  advanceWorkflow(). */
+  gated?: boolean;
   /** D6b distillation seam: fires after the stage completes with its typed result */
   onStageComplete?: (result: StageResult<O>) => Promise<void>;
 }
@@ -52,7 +56,7 @@ export interface WorkflowSpec<In = unknown> {
   input: Validator<In>;
 }
 
-export type WorkflowStatus = 'running' | 'awaiting_answer' | 'done' | 'failed';
+export type WorkflowStatus = 'running' | 'awaiting_answer' | 'awaiting_gate' | 'done' | 'failed';
 export type StageStatus = 'pending' | 'running' | 'paused' | 'done' | 'failed';
 
 export interface WorkflowRunRow {
