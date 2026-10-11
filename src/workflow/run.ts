@@ -143,6 +143,8 @@ export async function runWorkflow(
       tools: resolved.tools.map((name) => toolFromRegistry(name, deps.registry, resolved.policy, { sessionId: run.id })),
       ...(resolved.budgets ? { budget: resolved.budgets } : {}),
       onMessage: (msg) => { events.push(msg); },
+      // stream the stage turn: forward loop events (turn.delta/turn.tool) as workflow events
+      onEvent: (e) => { deps.emit?.({ type: `workflow.${e.type}` as 'workflow.turn.delta', runId: run.id, stageId: stage.id, detail: e.detail }); },
     });
     void events;
 
