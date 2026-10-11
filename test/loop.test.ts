@@ -44,7 +44,7 @@ describe('loop — happy paths (condition 2)', () => {
     expect(persisted.map((p) => p.role)).toEqual(['assistant', 'tool', 'assistant']);
     expect(persisted[1]).toEqual({ role: 'tool', in: 0, out: 0 });
     // event stream covers the lifecycle
-    expect(events.map((e) => e.type)).toContain('tool.call');
+    expect(events.map((e) => e.type)).toContain('turn.tool');
     expect(events.at(-1)?.type).toBe('turn.end');
     // the tool observation is in the transcript for the next provider call
     expect(result.messages.some((m) => m.role === 'tool' && m.content === 'echo: hi')).toBe(true);

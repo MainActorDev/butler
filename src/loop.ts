@@ -34,7 +34,7 @@ export interface LoopTool {
 }
 
 export interface TurnEvent {
-  type: 'turn.start' | 'provider.response' | 'tool.call' | 'tool.result' | 'turn.end' | 'turn.error' | 'turn.delta' | 'turn.tool';
+  type: 'turn.start' | 'provider.response' | 'turn.end' | 'turn.error' | 'turn.delta' | 'turn.tool';
   hop: number;
   detail?: unknown;
 }
@@ -134,7 +134,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
         const msg: ProviderMessage = { role: 'tool', content: obs, tool_call_id: call.id };
         messages.push(msg);
         deps.onMessage?.(msg, { hop, tokensIn: 0, tokensOut: 0 });
-        deps.onEvent?.({ type: 'tool.result', hop, detail: { id: call.id, unknown: true } });
+        deps.onEvent?.({ type: 'turn.tool', hop, detail: { phase: 'result', name: call.function.name, result: 'unknown tool — no result', isError: true } });
         continue;
       }
       let args: Record<string, unknown>;
@@ -150,7 +150,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
         }
         throw new LoopError(`tool ${call.function.name} sent invalid JSON twice`, 'TOOL_CALL_INVALID', messages);
       }
-      deps.onEvent?.({ type: 'tool.call', hop, detail: { id: call.id, name: call.function.name } });
+      deps.onEvent?.({ type: 'turn.tool', hop, detail: { phase: 'call', name: call.function.name } });
       let obs: string;
       try {
         obs = await tool.execute(args, { signal: deps.signal ?? undefined });
@@ -161,7 +161,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
       const msg: ProviderMessage = { role: 'tool', content: obs, tool_call_id: call.id };
       messages.push(msg);
       deps.onMessage?.(msg, { hop, tokensIn: 0, tokensOut: 0 });
-      deps.onEvent?.({ type: 'tool.result', hop, detail: { id: call.id, name: call.function.name, bytes: obs.length } });
+      deps.onEvent?.({ type: 'turn.tool', hop, detail: { phase: 'result', name: call.function.name, result: `${obs.length} bytes` } });
     }
   }
   throw new LoopError(`hop budget exhausted (${budget.maxHops})`, 'BUDGET_EXCEEDED', messages);
