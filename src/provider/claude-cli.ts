@@ -72,7 +72,7 @@ export class ClaudeCliProvider implements Provider {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     const args: string[] = ['-p', '--bare',
       '--output-format', 'stream-json', '--verbose',
-      '--permission-mode', 'default',
+      '--permission-mode', 'acceptEdits',
       '--allowedTools', ...this.allowedTools(),
       // HARD deny — allowedTools is only a hint; disallowedTools is the wall.
       // No shell, no web, no sub-agents, no notebooks: all data flows through
