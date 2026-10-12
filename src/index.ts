@@ -40,7 +40,7 @@ export type { SymbolInfo, SymbolChunk } from './sources/tree-sitter.ts';
 export { PostgresStorage } from './memory/postgres.ts';
 
 // Roadmap stage E — embeddings + hybrid retrieval
-export { HashEmbedding, OpenAICompatEmbedding, cosine } from './embeddings/index.ts';
+export { HashEmbedding, OpenAICompatEmbedding, TokenEmbedding, cosine } from './embeddings/index.ts';
 export type { EmbeddingProvider } from './embeddings/index.ts';
 
 // Roadmap stage D — orchestration L2
