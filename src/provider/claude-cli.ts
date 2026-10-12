@@ -45,6 +45,10 @@ const INTERNAL_PROGRESS = new Set(['thinking_tokens', 'task_progress', 'task_sta
 
 export class ClaudeCliProvider implements Provider {
   readonly model: string;
+  /** R2-F4: per-CALLER claude session map — one provider instance may serve many
+   *  Lionidas sessions; each keeps its own --resume continuity. A null/unset key
+   *  falls back to the legacy single-session behavior (back-compat). */
+  private readonly sessionIds = new Map<string, string>();
   private sessionId: string | null = null;
   private child: ChildProcess | null = null;
 
@@ -70,9 +74,13 @@ export class ClaudeCliProvider implements Provider {
   async complete(
     messages: ProviderMessage[],
     _tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
   ): Promise<ProviderResponse> {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
+    // R2-F4: isolation — the caller's key addresses its OWN claude session
+    const activeSession = opts.sessionKey !== undefined
+      ? this.sessionIds.get(opts.sessionKey) ?? null
+      : this.sessionId;
     const args: string[] = ['-p', '--bare',
       '--output-format', 'stream-json', '--verbose',
       '--permission-mode', 'acceptEdits',
@@ -86,7 +94,7 @@ export class ClaudeCliProvider implements Provider {
     // instead of the model shelling out with Bash/sqlite3)
     const mcp = (this.cfg as { mcpConfigPath?: string }).mcpConfigPath;
     if (mcp) args.push('--mcp-config', mcp);
-    if (this.sessionId) args.push('--resume', this.sessionId);
+    if (activeSession) args.push('--resume', activeSession);
 
     // conversation → a single prompt (claude -p is turn-based; the system
     // role rides --append-system-prompt to keep it out of the user turn).
@@ -182,7 +190,10 @@ export class ClaudeCliProvider implements Provider {
         if (settled) return; settled = true;
         if (buf.trim()) onLine(buf); // final unterminated line
         const init = events.find((e) => e.type === 'system' && e.session_id);
-        if (init?.session_id) this.sessionId = init.session_id;
+        if (init?.session_id) {
+          if (opts.sessionKey !== undefined) this.sessionIds.set(opts.sessionKey, init.session_id);
+          else this.sessionId = init.session_id;
+        }
         const result = events.find((e) => e.type === 'result');
         if (code !== 0 && !result) {
           reject(new ProviderError(`claude-cli exited ${code}: ${stderr.slice(0, 300)}`, 'PROVIDER_UNAVAILABLE', code ?? undefined, true));

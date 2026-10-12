@@ -63,7 +63,7 @@ export interface Provider {
   complete(
     messages: ProviderMessage[],
     tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: ((delta: string) => void) | undefined; onTool?: ((e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void) | undefined },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: ((delta: string) => void) | undefined; onTool?: ((e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void) | undefined; sessionKey?: string | undefined },
   ): Promise<ProviderResponse>;
   readonly model: string;
 }

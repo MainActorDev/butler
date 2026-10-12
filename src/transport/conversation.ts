@@ -130,6 +130,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         notesBlock = notesBlockFor(notes, undefined);
       }
       const result = await runLoop(deps.systemPrompt + notesBlock, b.content, {
+        sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
         history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
         provider: deps.provider,
         tools: registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission)).map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),

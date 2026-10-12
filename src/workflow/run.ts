@@ -142,9 +142,11 @@ export async function runWorkflow(
       ? String((vin.value as Record<string, unknown>)['ask'] ?? '')
       : '';
     const resolved = await resolveProfile(profile, { registry: deps.registry, storage: deps.storage, ...(deps.embedder && stageAsk ? { embedder: deps.embedder, query: stageAsk } : {}) });
+    void resolved;
 
     const events: ProviderMessage[] = [];
     const result = await runLoop(resolved.systemPrompt, JSON.stringify(vin.value), {
+      sessionKey: run.id, // R2-F4: each workflow run is its own claude session
       provider: resolved.provider,
       tools: resolved.tools.map((name) => toolFromRegistry(name, deps.registry, resolved.policy, { sessionId: run.id })),
       ...(resolved.budgets ? { budget: resolved.budgets } : {}),
