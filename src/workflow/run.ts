@@ -27,6 +27,8 @@ export interface WorkflowDeps {
   profiles: Record<string, AgentProfile>;
   /** event sink for stage transitions (consumers bridge to their bus) */
   emit?: (event: { type: string; runId: string; stageId?: string; detail?: unknown }) => void;
+  /** R2-F3: note embedder for retrieval-based memory injection */
+  embedder?: import('../embeddings/index.ts').EmbeddingProvider;
 }
 
 export class WorkflowError extends Error {
@@ -135,7 +137,11 @@ export async function runWorkflow(
     // resolve the stage's profile and run one loop turn
     const profile = deps.profiles[stage.profileId];
     if (!profile) throw new WorkflowError(`profile '${stage.profileId}' (stage '${stage.id}') not found`);
-    const resolved = await resolveProfile(profile, { registry: deps.registry, storage: deps.storage });
+    // R2-F3: retrieval ranking rides the stage input's ask as the query
+    const stageAsk = typeof vin.value === 'object' && vin.value !== null && 'ask' in (vin.value as Record<string, unknown>)
+      ? String((vin.value as Record<string, unknown>)['ask'] ?? '')
+      : '';
+    const resolved = await resolveProfile(profile, { registry: deps.registry, storage: deps.storage, ...(deps.embedder && stageAsk ? { embedder: deps.embedder, query: stageAsk } : {}) });
 
     const events: ProviderMessage[] = [];
     const result = await runLoop(resolved.systemPrompt, JSON.stringify(vin.value), {

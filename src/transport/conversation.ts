@@ -9,6 +9,9 @@ import type { Provider } from '../provider/index.ts';
 import type { Policy, ToolRegistry } from '../tools.ts';
 import type { TurnEvent } from '../loop.ts';
 import { toolFromRegistry } from './loop-adapter.ts';
+import { notesBlockFor } from '../profile/profile.ts';
+import { cosine } from '../embeddings/index.ts';
+import type { EmbeddingProvider } from '../embeddings/index.ts';
 
 export interface ConversationDeps {
   storage: Storage;
@@ -16,6 +19,8 @@ export interface ConversationDeps {
   registry: ToolRegistry;
   policy: Policy;
   systemPrompt: string;
+  /** R2-F3: note embedder — enables ranked note injection (falls back to recency) */
+  embedder?: EmbeddingProvider;
   budget?: { maxHops?: number; maxTokens?: number; wallMs?: number };
   /** consumer's event sink (WS bus in the demo; anything callable) */
   emit(event: TurnEvent & { sessionId: string }): void;
@@ -103,8 +108,27 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       // core-side note injection (review F3): active notes ride the system
       // prompt, provenance-marked — knowledge crosses sessions
       const notes = await storage.activeNotes();
-      const notesLines = notes.slice(0, 20).map((n) => `- [${n.kind} ${n.scope_key}] ${n.content} (source: ${n.source_ref})`).join('\n');
-      const notesBlock = notes.length ? `\n\n## Known notes (provenance-stamped memory)\n${notesLines}` : '';
+      // R2-F3: ranked retrieval when the consumer provides an embedder; the
+      // legacy recency top-20 remains the fallback (same block renderer)
+      let notesBlock = '';
+      if (deps.embedder) {
+        try {
+          const stored = await storage.noteEmbeddings(deps.embedder.model);
+          if (stored.length) {
+            const qv = (await deps.embedder.embed([b.content]))[0]!;
+            const byId = new Map(notes.map((n) => [n.id, n]));
+            const ranked = stored
+              .map((se) => ({ note: byId.get(se.noteId), score: cosine(qv, Array.from(se.vector)) }))
+              .filter((r): r is { note: NonNullable<typeof r.note>; score: number } => r.note !== undefined)
+              .sort((a, b2) => b2.score - a.score);
+            notesBlock = notesBlockFor(notes, undefined, ranked);
+          } else {
+            notesBlock = notesBlockFor(notes, undefined);
+          }
+        } catch { notesBlock = notesBlockFor(notes, undefined); }
+      } else {
+        notesBlock = notesBlockFor(notes, undefined);
+      }
       const result = await runLoop(deps.systemPrompt + notesBlock, b.content, {
         history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
         provider: deps.provider,

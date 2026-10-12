@@ -68,6 +68,17 @@ export function scopeMatches(scopeKey: string, pattern: string): boolean {
  *  Unscoped profiles (undefined) get NO notes block — knowledge must be
  *  declared, never ambient. */
 export function notesBlockFor(notes: NoteRow[], scopes: string[] | undefined, ranked?: Array<{ note: NoteRow; score: number }>): string {
+  // R2-F3: a ranking decides ORDER + top-k. With scopes, it ranks WITHIN the
+  // scope filter (scope boundaries never cross); without scopes (the chat
+  // path has no memoryScopes), ranked-all-notes is the retrieval mode.
+  if (ranked && ranked.length && (!scopes || scopes.length === 0)) {
+    const byId = new Set(ranked.map((r) => r.note.id));
+    const lines = notes.filter((n) => byId.has(n.id))
+      .sort((a, b) => ranked.findIndex((r) => r.note.id === b.id) - ranked.findIndex((r) => r.note.id === a.id))
+      .slice(0, 20)
+      .map((n) => `- [${n.kind} ${n.scope_key}] ${n.content} (source: ${n.source_ref})`);
+    return `\n\n## Known notes (retrieved by relevance — provenance-stamped memory)\n${lines.join('\n')}`;
+  }
   if (!scopes || scopes.length === 0) return '';
   const inScope = notes.filter((n) => scopes.some((p) => scopeMatches(n.scope_key, p)));
   if (!inScope.length) return '';
