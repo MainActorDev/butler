@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS butler_notes(
 );
 CREATE INDEX IF NOT EXISTS butler_notes_scope ON butler_notes(scope_key);
 
+CREATE TABLE IF NOT EXISTS butler_note_embeddings(
+  note_id TEXT PRIMARY KEY REFERENCES butler_notes(id),
+  model TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS butler_sources(
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL CHECK(kind IN ('jira','github','repo','file')),
@@ -177,6 +185,18 @@ export class SqliteStorage implements Storage {
       return this.db.prepare('SELECT * FROM butler_notes WHERE superseded_by IS NULL ORDER BY created_at DESC').all() as NoteRow[];
     }
     return this.db.prepare('SELECT * FROM butler_notes WHERE superseded_by IS NULL AND scope_key LIKE ? ORDER BY created_at DESC').all(`${scopeKeyPrefix}%`) as NoteRow[];
+  }
+
+  // ── note embeddings (R2-F3): retrieval-based memory ──
+  async saveNoteEmbedding(noteId: string, model: string, dim: number, vector: Float32Array): Promise<void> {
+    this.db.prepare('INSERT OR REPLACE INTO butler_note_embeddings(note_id, model, dim, vector, created_at) VALUES (?,?,?,?,?)')
+      .run(noteId, model, dim, Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength), Date.now());
+  }
+  async noteEmbeddings(model?: string): Promise<Array<{ noteId: string; model: string; dim: number; vector: Float32Array }>> {
+    const rows = (model
+      ? this.db.prepare('SELECT note_id, model, dim, vector FROM butler_note_embeddings WHERE model = ?').all(model)
+      : this.db.prepare('SELECT note_id, model, dim, vector FROM butler_note_embeddings').all()) as Array<{ note_id: string; model: string; dim: number; vector: Buffer }>;
+    return rows.map((r) => ({ noteId: r.note_id, model: r.model, dim: r.dim, vector: new Float32Array(r.vector.buffer, r.vector.byteOffset, r.vector.byteLength / 4) }));
   }
 
   async supersedeNote(id: string, byId: string, at: number, reason?: 'refuted' | 'refined' | 'superseded'): Promise<void> {

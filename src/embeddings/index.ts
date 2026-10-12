@@ -42,6 +42,52 @@ export class HashEmbedding implements EmbeddingProvider {
   }
 }
 
+/** Token-overlap embedding (R2-F3): deterministic, no network — but unlike
+ *  HashEmbedding it ranks by SHARED VOCABULARY, which is the honest local
+ *  option for note retrieval (domain notes share exact terms: 'voucher',
+ *  'identifier', 'home'). IDF-weighted tokens over a fixed vocab dim, so
+ *  cosine ≈ supervised token overlap. Used as the default embedder when no
+ *  embeddings endpoint is configured; a real provider replaces it via env.
+ *  Quality ceiling: lexical, not semantic — synonyms don't match. */
+export class TokenEmbedding implements EmbeddingProvider {
+  readonly model = 'token-overlap-v1';
+  readonly dimensions = 4096;
+  private readonly idf = new Map<string, number>();
+  private fitted = false;
+
+  /** corpus fit: compute IDF over known notes (once per process) */
+  fit(corpus: string[]): void {
+    const df = new Map<string, number>();
+    for (const doc of corpus) {
+      for (const t of new Set(this.tokens(doc))) df.set(t, (df.get(t) ?? 0) + 1);
+    }
+    for (const [t, n] of df) this.idf.set(t, Math.log((corpus.length + 1) / (n + 0.5)));
+    this.fitted = true;
+  }
+
+  private tokens(text: string): string[] {
+    return text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2);
+  }
+
+  async embed(texts: string[], _signal?: AbortSignal | undefined): Promise<number[][]> {
+    void _signal;
+    return texts.map((t) => this.one(t));
+  }
+
+  private one(text: string): number[] {
+    const v = new Array<number>(this.dimensions).fill(0);
+    for (const tok of this.tokens(text)) {
+      let h = 5381;
+      for (let i = 0; i < tok.length; i++) h = (Math.imul(h, 33) + tok.charCodeAt(i)) | 0;
+      const bucket = Math.abs(h) % this.dimensions;
+      const weight = this.fitted ? (this.idf.get(tok) ?? 1.5) : 1;
+      v[bucket] = (v[bucket] ?? 0) + weight;
+    }
+    const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0)) || 1;
+    return v.map((x) => x / norm);
+  }
+}
+
 /** OpenAI-compatible /embeddings adapter (injectable fetch for tests). */
 export class OpenAICompatEmbedding implements EmbeddingProvider {
   readonly model: string;

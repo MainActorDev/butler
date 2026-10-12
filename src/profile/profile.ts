@@ -8,6 +8,8 @@ import type { Provider, ProviderConfig } from '../provider/types.ts';
 import type { LoopBudget } from '../loop.ts';
 import type { Permission, ToolRegistry } from '../tools.ts';
 import type { Storage, NoteRow } from '../memory/contract.ts';
+import type { EmbeddingProvider } from '../embeddings/index.ts';
+import { cosine } from '../embeddings/index.ts';
 import { OpenAICompatProvider } from '../provider/openai-compat.ts';
 import { MockProvider, type ScriptedTurn } from '../provider/mock.ts';
 
@@ -65,11 +67,16 @@ export function scopeMatches(scopeKey: string, pattern: string): boolean {
 /** D6a: assemble the notes block for the profile's declared scopes ONLY.
  *  Unscoped profiles (undefined) get NO notes block — knowledge must be
  *  declared, never ambient. */
-export function notesBlockFor(notes: NoteRow[], scopes: string[] | undefined): string {
+export function notesBlockFor(notes: NoteRow[], scopes: string[] | undefined, ranked?: Array<{ note: NoteRow; score: number }>): string {
   if (!scopes || scopes.length === 0) return '';
   const inScope = notes.filter((n) => scopes.some((p) => scopeMatches(n.scope_key, p)));
   if (!inScope.length) return '';
-  const lines = inScope.slice(0, 20).map((n) => {
+  // R2-F3: when a RANKING exists (retrieval path), it decides order and top-k;
+  // otherwise the legacy recency top-20 applies — one fallback path, every consumer
+  const selected = ranked
+    ? ranked.filter((r) => inScope.includes(r.note)).map((r) => r.note)
+    : inScope.slice(0, 20);
+  const lines = selected.slice(0, 20).map((n) => {
     const reason = n.superseded_reason ? ` (superseded: ${n.superseded_reason})` : '';
     return `- [${n.kind} ${n.scope_key}] ${n.content} (source: ${n.source_ref}${reason})`;
   });
@@ -94,7 +101,7 @@ export async function providerFromConfig(cfg: ExecutorConfig): Promise<Provider>
  *  policy, constructed provider, system prompt with scope-filtered notes. */
 export async function resolveProfile(
   profile: AgentProfile,
-  deps: { registry: ToolRegistry; storage: Storage },
+  deps: { registry: ToolRegistry; storage: Storage; embedder?: EmbeddingProvider; query?: string },
 ): Promise<ResolvedProfile> {
   // tool subset must exist in the registry (typo guard — fail at resolve, not mid-run)
   if (profile.tools !== '*') {
@@ -111,7 +118,24 @@ export async function resolveProfile(
     : [...profile.tools];
   const provider = await providerFromConfig(profile.provider);
   const notes = await deps.storage.activeNotes();
-  const notesBlock = notesBlockFor(notes, profile.memoryScopes);
+  // R2-F3: retrieval ranking — embed the query, cosine against stored note
+  // embeddings, rank the scoped notes. ANY failure (no embedder, no stored
+  // vectors, embed error) degrades to the legacy recency block — never breaks.
+  let ranked: Array<{ note: NoteRow; score: number }> | undefined;
+  if (deps.embedder && deps.query) {
+    try {
+      const stored = await deps.storage.noteEmbeddings(deps.embedder.model);
+      if (stored.length) {
+        const qv = (await deps.embedder.embed([deps.query]))[0]!;
+        const byId = new Map(notes.map((n) => [n.id, n]));
+        ranked = stored
+          .map((se) => ({ note: byId.get(se.noteId), score: cosine(qv, Array.from(se.vector)) }))
+          .filter((r): r is { note: NoteRow; score: number } => r.note !== undefined)
+          .sort((a, b) => b.score - a.score);
+      }
+    } catch { /* degrade to recency */ }
+  }
+  const notesBlock = notesBlockFor(notes, profile.memoryScopes, ranked);
   return {
     systemPrompt: profile.systemPrompt + notesBlock,
     tools,

@@ -223,6 +223,16 @@ export class PostgresStorage implements Storage {
     } as NoteRow;
   }
 
+  // R2-F3: embeddings live in the sqlite side-table path; postgres storage does
+  // not implement them yet — honest no-op keeps the optional capability typed.
+  async noteEmbeddings(_model?: string): Promise<Array<{ noteId: string; model: string; dim: number; vector: Float32Array }>> {
+    void _model;
+    return [];
+  }
+  async saveNoteEmbedding(_noteId: string, _model: string, _dim: number, _vector: Float32Array): Promise<void> {
+    void _noteId; void _model; void _dim; void _vector;
+  }
+
   async activeNotes(scopeKeyPrefix?: string): Promise<NoteRow[]> {
     const r = scopeKeyPrefix === undefined
       ? await this.pool.query('SELECT * FROM butler_notes WHERE superseded_by IS NULL ORDER BY created_at DESC')

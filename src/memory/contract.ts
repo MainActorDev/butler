@@ -113,6 +113,9 @@ export interface Storage {
   // notes (explicit-write only; supersession, never delete)
   insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at' | 'superseded_reason'>): Promise<NoteRow>;
   activeNotes(scopeKeyPrefix?: string): Promise<NoteRow[]>;
+  /** R2-F3: retrieval-based memory — stored note embeddings (optional capability) */
+  noteEmbeddings(model?: string): Promise<Array<{ noteId: string; model: string; dim: number; vector: Float32Array }>>;
+  saveNoteEmbedding(noteId: string, model: string, dim: number, vector: Float32Array): Promise<void>;
   supersedeNote(id: string, byId: string, at: number, reason?: 'refuted' | 'refined' | 'superseded'): Promise<void>;
   getNote(id: string): Promise<NoteRow | null>;
 
