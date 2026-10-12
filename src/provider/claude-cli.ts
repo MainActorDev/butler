@@ -89,11 +89,20 @@ export class ClaudeCliProvider implements Provider {
     if (this.sessionId) args.push('--resume', this.sessionId);
 
     // conversation → a single prompt (claude -p is turn-based; the system
-    // role rides --append-system-prompt to keep it out of the user turn)
+    // role rides --append-system-prompt to keep it out of the user turn).
+    // R2-F1: history must ride the prompt TEXT — claude -p is stateless without
+    // --resume, and cross-provider turns (workflow skills) never share a claude
+    // session, so transcript rows would otherwise vanish from context.
     const system = messages.filter((m) => m.role === 'system').map((m) => m.content ?? '').join('\n');
     if (system) args.push('--append-system-prompt', system);
     const userTurn = [...messages].reverse().find((m) => m.role === 'user');
-    const prompt = userTurn?.content ?? '';
+    const priorTurns = messages.filter((m) => m.role === 'user' || m.role === 'assistant');
+    const lastUserIdx = priorTurns.map((m) => m.role).lastIndexOf('user');
+    const history = priorTurns.slice(0, lastUserIdx === -1 ? undefined : lastUserIdx);
+    const historyBlock = history.length
+      ? `## Conversation so far\n${history.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content ?? ''}`).join('\n\n')}\n\n## Current message\n`
+      : '';
+    const prompt = `${historyBlock}${userTurn?.content ?? ''}`;
 
     return new Promise<ProviderResponse>((resolve, reject) => {
       const child = spawn(bin, [...args, prompt], {
