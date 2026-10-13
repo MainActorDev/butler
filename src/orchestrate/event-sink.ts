@@ -84,28 +84,36 @@ export class EventSink {
     this.recoverOrphans();
   }
 
-  /** R3 crash recovery: turns left 'running' by a dead process are marked
+  /** R3 crash recovery: turns left running by a dead process are marked
    *  failed with partial content preserved (their events remain — replay shows
-   *  exactly how far they got). Called once at construction; idempotent. */
+   *  exactly how far they got). Called once at construction; idempotent.
+   *
+   *  v0.5.2 (sess_e2e40228 zombie): candidates come from the EVENT LOG (the
+   *  fold's activeTurnId), NOT from the butler_turns projection. A projection
+   *  row can disagree with the log (stale heal, manual write, foreign build);
+   *  when it does, the log wins — the projection is derivable cache. Any turn
+   *  the fold still considers active, whose last event is older than the
+   *  freshness window, is failed and the projection row RECONCILED to match. */
   recoverOrphans(freshMs: number = 15 * 60_000): void {
     // FRESHNESS GUARD (split-brain fix, sess_e2e40228): a sibling process's
     // boot-time sweep must not fail turns that are plausibly LIVE elsewhere.
-    // Only turns idle beyond the freshness window (no event for freshMs, and
-    // started more than freshMs ago) are recovered. Live turns keep appending
-    // events, so their last-event age stays small.
-    const rows = this.db.prepare(`
-      SELECT t.id, t.session_id,
-             (SELECT COALESCE(MAX(e.at), t.created_at) FROM butler_turn_events e WHERE e.session_id = t.session_id) AS last_at
-      FROM butler_turns t
-      WHERE t.status IN ('running','requested')
-        AND ? - last_at > ?`).all(Date.now(), freshMs) as Array<{ id: string; session_id: string }>;
-    for (const r of rows) {
-      const seq = (this.db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM butler_turn_events WHERE session_id = ?').get(r.session_id) as { m: number }).m;
+    // Live turns keep appending events, so their last-event age stays small.
+    const sessions = this.db.prepare('SELECT DISTINCT session_id FROM butler_turn_events').all() as Array<{ session_id: string }>;
+    for (const { session_id } of sessions) {
+      const st = this.replay(session_id);
+      const active = st.activeTurnId;
+      if (active === null) continue;
+      // last event AT for THIS turn (the session may carry later events from siblings)
+      const rows = this.db.prepare('SELECT COALESCE(MAX(at), 0) AS last_at FROM butler_turn_events WHERE turn_id = ?').all(active) as Array<{ last_at: number }>;
+      const lastAt = rows[0]?.last_at ?? 0;
+      if (Date.now() - lastAt <= freshMs) continue; // plausibly live elsewhere
+      const seq = (this.db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM butler_turn_events WHERE session_id = ?').get(session_id) as { m: number }).m;
       const now = Date.now();
       this.db.prepare('INSERT INTO butler_turn_events(id, turn_id, session_id, parent_id, schema_version, seq, kind, detail_json, at) VALUES (?,?,?,?,?,?,?,?,?)')
-        .run(`ev_recover_${r.id}`, r.id, r.session_id, null, 1, seq + 1, 'turn.failed', JSON.stringify({ error: 'recovered: process died mid-turn (kill/crash); partial content preserved in prior events' }), now);
-      this.db.prepare('UPDATE butler_turns SET status = ?, updated_at = ? WHERE id = ?').run('failed', now, r.id);
-      this.states.delete(r.session_id);
+        .run(`ev_recover_${active}`, active, session_id, null, 1, seq + 1, 'turn.failed', JSON.stringify({ error: 'recovered: process died mid-turn (kill/crash); partial content preserved in prior events' }), now);
+      // reconcile the projection to the log — whatever it claimed before
+      this.db.prepare('UPDATE butler_turns SET status = ?, updated_at = ? WHERE id = ?').run('failed', now, active);
+      this.states.delete(session_id);
     }
   }
 

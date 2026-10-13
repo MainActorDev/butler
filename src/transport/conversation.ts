@@ -102,7 +102,16 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         if (st.activeTurnId) {
           const events = deps.sink.events(id);
           const started = [...events].reverse().find((e) => e.kind === 'turn.started' && e.turn_id === st.activeTurnId);
-          liveTurn = { turnId: st.activeTurnId, startedAt: started?.at ?? Date.now() };
+          const lastForTurn = [...events].reverse().find((e) => e.turn_id === st.activeTurnId);
+          // v0.5.2 freshness guard (zombie liveTurn): a turn whose last event is
+          // older than the recovery window is NOT live — recovery will fail it.
+          // Reporting it as in-flight would spin the UI forever.
+          const STALE_MS = 15 * 60_000;
+          if (lastForTurn && Date.now() - lastForTurn.at > STALE_MS) {
+            liveTurn = null;
+          } else {
+            liveTurn = { turnId: st.activeTurnId, startedAt: started?.at ?? Date.now() };
+          }
         }
       } catch { /* state read is best-effort */ }
     }

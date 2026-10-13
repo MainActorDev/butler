@@ -131,6 +131,45 @@ describe('crash recovery (kill -9 drill, in-memory)', () => {
   });
 });
 
+describe('zombie liveTurn (v0.5.2 — projection/log divergence, sess_e2e40228)', () => {
+  it('projection claims completed but the LOG has no terminal event → recovery fails the turn anyway (the log wins)', () => {
+    const sk = sink();
+    sk.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't1', prompt: 'doom', refIds: [], at: 0 }, 'k1');
+    // process dies mid-turn; a stale heal then writes a LYING projection row:
+    const db = (sk as unknown as { db: import('better-sqlite3').Database }).db;
+    db.prepare("UPDATE butler_turns SET status = 'completed', updated_at = updated_at + 937 WHERE session_id = ?").run(sess);
+    // age past the freshness window:
+    db.prepare('UPDATE butler_turn_events SET at = at - ? WHERE session_id = ?').run(20 * 60_000, sess);
+    db.prepare('UPDATE butler_turns SET created_at = created_at - ? WHERE session_id = ?').run(20 * 60_000, sess);
+    const revived = new EventSink(db);
+    const evs = revived.events(sess);
+    expect(evs.at(-1)?.kind).toBe('turn.failed');            // terminal event appended
+    const st = revived.replay(sess);
+    expect(st.activeTurnId).toBeNull();                       // fold no longer sees it live
+    expect(st.turns.find((t) => t.id === 't1')?.status).toBe('failed');
+    // and the projection was RECONCILED to match the log:
+    const row = db.prepare('SELECT status FROM butler_turns WHERE id = ?').get('t1') as { status: string };
+    expect(row.status).toBe('failed');
+  });
+
+  it('liveTurn freshness guard: a turn whose last event is ancient is NOT reported live', async () => {
+    // long-running server, turn stalled silently > 15min, NO restart yet: the
+    // fold's cached state still says active — the transport must not report
+    // it live (recovery only fires at sink construction)
+    const sk = sink();
+    sk.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't1', prompt: 'stale', refIds: [], at: 0 }, 'k1');
+    const db = (sk as unknown as { db: import('better-sqlite3').Database }).db;
+    db.prepare('UPDATE butler_turn_events SET at = at - ? WHERE session_id = ?').run(30 * 60_000, sess);
+    const st = sk.state(sess);
+    expect(st.activeTurnId).toBe('t1'); // cached fold still holds it…
+    const events = sk.events(sess);
+    const lastForTurn = [...events].reverse().find((e) => e.turn_id === 't1');
+    const STALE_MS = 15 * 60_000;
+    const isLive = !(lastForTurn && Date.now() - lastForTurn.at > STALE_MS);
+    expect(isLive).toBe(false); // …but the freshness guard says not live
+  });
+});
+
 describe('chunk cap (the 219,961-token fix)', () => {
   it('a heading-less 255k-char file splits into capped chunks — no giant chunk survives', async () => {
     const { structuralChunks, MAX_CHUNK_CHARS } = await import('../src/chunk.ts');
