@@ -111,3 +111,19 @@ describe('EventSink transactions', () => {
     expect(sk.replay(sess).imported).toBe(true);
   });
 });
+
+describe('crash recovery (kill -9 drill, in-memory)', () => {
+  it('orphaned running turn → recoverOrphans marks failed + appends turn.failed event', () => {
+    const sk = sink();
+    sk.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't1', prompt: 'slow', refIds: [], at: 0 }, 'k1');
+    sk.handle(sess, { kind: 'turn.chunk', sessionId: sess, turnId: 't1', delta: 'partial ' }, 'k2');
+    // process dies here — NO complete/fail. A NEW sink instance over the same DB:
+    const db = (sk as unknown as { db: import('better-sqlite3').Database }).db;
+    const revived = new EventSink(db);
+    const evs = revived.events(sess);
+    expect(evs.at(-1)?.kind).toBe('turn.failed');
+    const st = revived.replay(sess);
+    expect(st.turns.find((t) => t.id === 't1')?.status).toBe('failed');
+    expect(revived.state(sess).activeTurnId).toBeNull(); // no lying spinner, next turn accepted
+  });
+});

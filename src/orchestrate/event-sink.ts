@@ -81,6 +81,22 @@ export class EventSink {
 
   constructor(private readonly db: Database.Database) {
     db.exec(DDL);
+    this.recoverOrphans();
+  }
+
+  /** R3 crash recovery: turns left 'running' by a dead process are marked
+   *  failed with partial content preserved (their events remain — replay shows
+   *  exactly how far they got). Called once at construction; idempotent. */
+  recoverOrphans(): void {
+    const rows = this.db.prepare("SELECT id, session_id FROM butler_turns WHERE status IN ('running','requested')").all() as Array<{ id: string; session_id: string }>;
+    for (const r of rows) {
+      const seq = (this.db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM butler_turn_events WHERE session_id = ?').get(r.session_id) as { m: number }).m;
+      const now = Date.now();
+      this.db.prepare('INSERT INTO butler_turn_events(id, turn_id, session_id, parent_id, schema_version, seq, kind, detail_json, at) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(`ev_recover_${r.id}`, r.id, r.session_id, null, 1, seq + 1, 'turn.failed', JSON.stringify({ error: 'recovered: process died mid-turn (kill/crash); partial content preserved in prior events' }), now);
+      this.db.prepare('UPDATE butler_turns SET status = ?, updated_at = ? WHERE id = ?').run('failed', now, r.id);
+      this.states.delete(r.session_id);
+    }
   }
 
   /** Load (and cache) a session's orchestrator state by folding its events. */
