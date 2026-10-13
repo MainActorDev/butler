@@ -104,6 +104,15 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     // keeps the direct append so existing hosts don't break.
     const durableTurnId = `t_${crypto.randomUUID().slice(0, 12)}`;
     if (deps.sink) {
+      // R3 queue-drain: a followUp message queued against an earlier (now-dead)
+      // turn starts ITS OWN turn — the queue must never strand content silently.
+      const st = deps.sink.state(id);
+      const queuedIdx = st.queue.followUp.indexOf(b.content);
+      const noActive = st.activeTurnId === null;
+      if (queuedIdx !== -1 && noActive) {
+        // drain: this request IS the queued message → run as the next turn
+        deps.sink.handle(id, { kind: 'message.queue', sessionId: id, content: b.content, disposition: 'steering' }, `chat:${id}:${durableTurnId}:dequeue`);
+      }
       deps.sink.handle(id, { kind: 'turn.request', sessionId: id, turnId: durableTurnId, prompt: b.content, refIds: [], at: Date.now() }, `chat:${id}:${durableTurnId}`);
     } else {
       await storage.appendMessage({ session_id: id, role: 'user', content: b.content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
