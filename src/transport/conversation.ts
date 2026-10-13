@@ -19,6 +19,10 @@ export interface ConversationDeps {
   sink?: EventSink;
   /** R3-S5: provider context window for the usage meter (default 200k) */
   contextWindow?: number;
+  /** commands-as-chat-turns (plan 20261013T144145Z): resolves the message's
+   *  commands into a prompt overlay + optional tool narrowing. Butler stays
+   *  command-agnostic — the HOST owns the registry. */
+  commandOverlay?: (cmds: string[]) => { promptBlock: string; tools?: string[] } | null;
   storage: Storage;
   provider: Provider;
   registry: ToolRegistry;
@@ -93,7 +97,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
 
   app.post('/api/agent/sessions/:id/messages', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const b = (req.body ?? {}) as { content?: string };
+    const b = (req.body ?? {}) as { content?: string; commands?: string[] };
     if (!b.content?.trim()) return reply.code(400).send({ error: 'content required' });
     const session = await storage.getSession(id);
     if (!session) return reply.code(404).send({ error: 'session not found' });
@@ -152,11 +156,21 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         notesBlock = notesBlockFor(notes, undefined);
       }
       const sink = deps.sink; // durable path: chunks/tools/usage/completion ride commands
-      const result = await runLoop(deps.systemPrompt + notesBlock, b.content, {
+      // commands-as-chat-turns: overlay composes AFTER the base (host's block
+      // already carries command bodies only — no double base, review CR1)
+      const overlay = Array.isArray((b as { commands?: string[] }).commands) && deps.commandOverlay
+        ? deps.commandOverlay(((b as { commands?: string[] }).commands ?? []).filter((c): c is string => typeof c === 'string'))
+        : null;
+      const cmdBlock = overlay ? overlay.promptBlock : '';
+      const allowedTools = registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission));
+      const toolSet = overlay?.tools?.length
+        ? allowedTools.filter((t) => overlay.tools!.includes(t.name))
+        : allowedTools;
+      const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock, b.content, {
         sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
         history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
         provider: deps.provider,
-        tools: registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission)).map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
+        tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),
         signal: ac.signal,
         // rev10: live token stream → transport events (WS bridge streams UI)
