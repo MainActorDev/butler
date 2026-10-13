@@ -5,6 +5,7 @@
 import type { FastifyInstance } from 'fastify';
 import type { Storage } from '../memory/contract.ts';
 import { runLoop } from '../loop.ts';
+import type { EventSink } from '../orchestrate/event-sink.ts';
 import type { Provider } from '../provider/index.ts';
 import type { Policy, ToolRegistry } from '../tools.ts';
 import type { TurnEvent } from '../loop.ts';
@@ -14,6 +15,10 @@ import { cosine } from '../embeddings/index.ts';
 import type { EmbeddingProvider } from '../embeddings/index.ts';
 
 export interface ConversationDeps {
+  /** R3-S5: durable engine — when set, turns ride the event log (single-writer rule) */
+  sink?: EventSink;
+  /** R3-S5: provider context window for the usage meter (default 200k) */
+  contextWindow?: number;
   storage: Storage;
   provider: Provider;
   registry: ToolRegistry;
@@ -94,7 +99,15 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     if (!session) return reply.code(404).send({ error: 'session not found' });
     if (activeTurns.has(id)) return reply.code(409).send({ error: 'turn already in flight on this session' });
 
-    await storage.appendMessage({ session_id: id, role: 'user', content: b.content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
+    // R3-S5 single-writer rule: user message rides the durable log when a sink
+    // is wired; the projection writes butler_messages. Legacy path (no sink)
+    // keeps the direct append so existing hosts don't break.
+    const durableTurnId = `t_${crypto.randomUUID().slice(0, 12)}`;
+    if (deps.sink) {
+      deps.sink.handle(id, { kind: 'turn.request', sessionId: id, turnId: durableTurnId, prompt: b.content, refIds: [], at: Date.now() }, `chat:${id}:${durableTurnId}`);
+    } else {
+      await storage.appendMessage({ session_id: id, role: 'user', content: b.content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
+    }
 
     // resume context from rows alone (condition 4)
     const history = (await storage.sessionMessages(id))
@@ -129,6 +142,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       } else {
         notesBlock = notesBlockFor(notes, undefined);
       }
+      const sink = deps.sink; // durable path: chunks/tools/usage/completion ride commands
       const result = await runLoop(deps.systemPrompt + notesBlock, b.content, {
         sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
         history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
@@ -139,14 +153,24 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         // rev10: live token stream → transport events (WS bridge streams UI)
         ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
         onMessage: (msg, meta) => {
-          void storage.appendMessage({
+          if (!sink) void storage.appendMessage({
             session_id: id, role: msg.role, content: msg.content,
             tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
             tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
           });
         },
-        onEvent: (e) => deps.emit({ ...e, sessionId: id }),
+        onEvent: (e) => {
+          deps.emit({ ...e, sessionId: id });
+          if (sink) {
+            if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) sink.handle(id, { kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta) }, `chat:${durableTurnId}:d:${Math.random()}`);
+            if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
+              const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
+              if (t) sink.handle(id, { kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } }, `chat:${durableTurnId}:u:${Math.random()}`);
+            }
+          }
+        },
       });
+      if (sink) sink.handle(id, { kind: 'turn.complete', sessionId: id, turnId: durableTurnId, answer: result.answer }, `chat:${durableTurnId}:done`);
       outcome.ok = true;
       outcome.answer = result.answer;
       outcome.tokens = result.tokens;
@@ -157,6 +181,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     } catch (err) {
       const e = err as { code?: string; message?: string };
       outcome.error = e.message ?? String(err);
+      if (deps.sink) deps.sink.handle(id, { kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error }, `chat:${durableTurnId}:fail`);
       outcome.code = e.code ?? undefined;
       await storage.updateSession(id, { status: 'error' });
       activeTurns.delete(id);
