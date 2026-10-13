@@ -11,6 +11,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { runLoop } from '../loop.ts';
+import type { EventSink } from '../orchestrate/event-sink.ts';
 import type { LoopTool } from '../loop.ts';
 import type { ProviderMessage } from '../provider/types.ts';
 import { resolveProfile } from '../profile/profile.ts';
@@ -21,6 +22,8 @@ import type { WorkflowSpec, WorkflowStorage, WorkflowRunRow, StageSpec, Question
 import { isQuestionPayload } from './spec.ts';
 
 export interface WorkflowDeps {
+  /** R3-S4: when set, stage turns are durable events (runId-keyed sessions) */
+  sink?: EventSink;
   storage: Storage;
   workflow: WorkflowStorage;
   registry: ToolRegistry;
@@ -145,15 +148,27 @@ export async function runWorkflow(
     void resolved;
 
     const events: ProviderMessage[] = [];
+    // R3-S4: when a sink is wired, the stage TURN is durable (runId-keyed session):
+    // request → runLoop → chunk/tool/usage events → complete/fail. Skills become
+    // replayable exactly like chat; gates/pause/resume stay on workflow storage.
+    const durableTurnId = deps.sink ? `wfr_${run.id}_${stage.id}_${attempt}` : null;
+    if (deps.sink && durableTurnId) {
+      deps.sink.handle(run.id, { kind: 'turn.request', sessionId: run.id, turnId: durableTurnId, prompt: JSON.stringify(vin.value), refIds: [], at: Date.now() }, `wf:${durableTurnId}:req`);
+    }
     const result = await runLoop(resolved.systemPrompt, JSON.stringify(vin.value), {
       sessionKey: run.id, // R2-F4: each workflow run is its own claude session
       provider: resolved.provider,
       tools: resolved.tools.map((name) => toolFromRegistry(name, deps.registry, resolved.policy, { sessionId: run.id })),
       ...(resolved.budgets ? { budget: resolved.budgets } : {}),
       onMessage: (msg) => { events.push(msg); },
+      onDelta: (d) => { if (deps.sink && durableTurnId) deps.sink.handle(run.id, { kind: 'turn.chunk', sessionId: run.id, turnId: durableTurnId, delta: d }, `wf:${durableTurnId}:d:${d.length}:${Math.random()}`); },
+      onTool: (t) => { if (deps.sink && durableTurnId) deps.sink.handle(run.id, { kind: 'turn.tool', sessionId: run.id, turnId: durableTurnId, phase: t.phase === 'call' ? 'call' : 'update', toolCallId: `tc_${durableTurnId}_${t.name}`, ...(t.phase === 'call' ? { name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } : { ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) }) }, `wf:${durableTurnId}:t:${t.name}:${t.phase}:${Math.random()}`); },
       // stream the stage turn: forward loop events (turn.delta/turn.tool) as workflow events
       onEvent: (e) => { deps.emit?.({ type: `workflow.${e.type}` as 'workflow.turn.delta', runId: run.id, stageId: stage.id, detail: e.detail }); },
     });
+    if (deps.sink && durableTurnId) {
+      deps.sink.handle(run.id, { kind: 'turn.complete', sessionId: run.id, turnId: durableTurnId, answer: result.answer }, `wf:${durableTurnId}:done`);
+    }
     void events;
 
     const answer = result.answer ?? '';
