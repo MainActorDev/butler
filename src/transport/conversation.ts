@@ -92,7 +92,21 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     const { id } = req.params as { id: string };
     const row = await storage.getSession(id);
     if (!row) return reply.code(404).send({ error: 'session not found' });
-    return { session: row, messages: await storage.sessionMessages(id) };
+    // live-turn fact for reloads: a user message with no answer yet is either
+    // ABORTED (dead turn) or IN FLIGHT (still running here or in a sibling
+    // process) — the UI must not guess (sess_e2e40228 lesson)
+    let liveTurn: { turnId: string; startedAt: number } | null = null;
+    if (deps.sink) {
+      try {
+        const st = deps.sink.state(id);
+        if (st.activeTurnId) {
+          const events = deps.sink.events(id);
+          const started = [...events].reverse().find((e) => e.kind === 'turn.started' && e.turn_id === st.activeTurnId);
+          liveTurn = { turnId: st.activeTurnId, startedAt: started?.at ?? Date.now() };
+        }
+      } catch { /* state read is best-effort */ }
+    }
+    return { session: row, messages: await storage.sessionMessages(id), ...(liveTurn ? { liveTurn } : {}) };
   });
 
   app.post('/api/agent/sessions/:id/messages', async (req, reply) => {
