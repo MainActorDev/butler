@@ -168,6 +168,14 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
             tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
           });
         },
+        onTool: (t) => {
+          // R3 fix: tool calls are durable entities too — the rail correlates by
+          // toolCallId, and the replay log must show HOW an answer was derived.
+          if (!sink) return;
+          const stable = `tc_${durableTurnId}_${t.name}`;
+          if (t.phase === 'call') sink.handle(id, { kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) }, `chat:${durableTurnId}:tc:${stable}`);
+          else sink.handle(id, { kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) }, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
+        },
         onEvent: (e) => {
           deps.emit({ ...e, sessionId: id });
           if (sink) {
