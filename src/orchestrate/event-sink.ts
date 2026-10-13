@@ -181,10 +181,15 @@ export class EventSink {
     } else if (e.kind === 'turn.completed' || e.kind === 'turn.failed' || e.kind === 'turn.aborted') {
       this.db.prepare('UPDATE butler_turns SET status = ?, updated_at = ? WHERE id = ?').run(e.kind === 'turn.completed' ? 'completed' : e.kind === 'turn.failed' ? 'failed' : 'aborted', e.at, e.turn_id);
     }
-    // message projection: user_message.recorded → butler_messages row (single-writer rule)
+    // message projection (single-writer rule): every butler_messages row comes
+    // from an event — user_message.recorded AND the turn's final answer.
     if (e.kind === 'user_message.recorded') {
       this.db.prepare('INSERT INTO butler_messages(id, session_id, role, content, tool_calls_json, tool_results_json, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
         .run(e.id, e.session_id, e.detail.role, e.detail.content, null, null, 0, 0, e.at);
+    }
+    if (e.kind === 'turn.completed' && e.detail.answer) {
+      this.db.prepare('INSERT INTO butler_messages(id, session_id, role, content, tool_calls_json, tool_results_json, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(e.id, e.session_id, 'assistant', e.detail.answer, null, null, 0, 0, e.at);
     }
   }
 }
