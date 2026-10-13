@@ -102,12 +102,14 @@ describe('loop — budgets (condition 2)', () => {
       .rejects.toMatchObject({ code: 'BUDGET_EXCEEDED', partial: expect.any(Array) });
   });
 
-  it('token budget exhaustion → BUDGET_EXCEEDED', async () => {
+  it('token budget exceeded → ADVISORY (R3 decision 4): completes, event streams', async () => {
     const provider = new MockProvider([
       { kind: 'assistant', content: 'big', usage: { promptTokens: 90, completionTokens: 20 } },
     ]);
-    await expect(runLoop('sys', 'go', { provider, tools: [], budget: { maxTokens: 100 } }))
-      .rejects.toMatchObject({ code: 'BUDGET_EXCEEDED' });
+    const advisories: unknown[] = [];
+    const res = await runLoop('sys', 'go', { provider, tools: [], budget: { maxTokens: 100 }, onEvent: (e) => { if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'advisory' in e.detail) advisories.push(e.detail); } });
+    expect(res.answer).toBe('big');           // no interruption
+    expect(advisories.length).toBe(1);        // the warning streamed
   });
 
   it('wall budget exhaustion → BUDGET_EXCEEDED', async () => {

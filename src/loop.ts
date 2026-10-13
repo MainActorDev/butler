@@ -64,6 +64,8 @@ export interface LoopDeps {
   sessionKey?: string;
   /** structured tool events (claude-cli harness + registry loop) */
   onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void;
+  /** R3 decision 4: opt INTO the hard token cap (fan-out children); default advisory */
+  hardTokenCap?: boolean;
   signal?: AbortSignal;
 }
 
@@ -116,8 +118,17 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     deps.onMessage?.(res.message, { hop, tokensIn: res.usage?.promptTokens ?? 0, tokensOut: res.usage?.completionTokens ?? 0 });
     deps.onEvent?.({ type: 'provider.response', hop, detail: { finishReason: res.finishReason, tokens: res.usage } });
 
+    // R3 decision 4: cost meter is ADVISORY for chat turns — it streams (usage
+    // event) and never aborts. The old hard throw produced the 'turn failed:
+    // token budget exceeded (202315 > 200000)' interruption class; context
+    // pressure is absorbed by compaction at the orchestrator layer, not by dying.
+    // Fan-out children (deliberate per-child caps) opt back into the hard stop
+    // via hardTokenCap=true; the runaway guard remains the universal backstop.
     if (tokens.in + tokens.out > budget.maxTokens) {
-      throw new LoopError(`token budget exceeded (${tokens.in + tokens.out} > ${budget.maxTokens})`, 'BUDGET_EXCEEDED', messages);
+      if (deps.hardTokenCap) {
+        throw new LoopError(`token budget exceeded (${tokens.in + tokens.out} > ${budget.maxTokens})`, 'BUDGET_EXCEEDED', messages);
+      }
+      deps.onEvent?.({ type: 'turn.delta', hop, detail: { advisory: `cost ${tokens.in + tokens.out} > ${budget.maxTokens} (advisory)` } });
     }
 
     const calls = res.message.tool_calls ?? [];
