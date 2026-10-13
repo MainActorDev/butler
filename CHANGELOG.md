@@ -1,3 +1,10 @@
+## [0.5.0] — 2026-10-13 (R3 final)
+
+### Added (since rc)
+- Orphan recovery: turns left `running`/`requested` by a dead process are marked failed at sink construction, partial content preserved (kill -9 semantics, live-drilled).
+- Queue-drain seam: a queued followUp with no active turn starts its own turn — no stranded content after crash recovery.
+- S6: migration test from a real v0.4.2 DB snapshot (fixture), concurrency (interleaved streams serialize; two sessions zero cross-talk), perf sanity (append < 5ms avg).
+
 ## [0.5.0-rc] — 2026-10-13 (R3: durable chat core + ACP v1 wire)
 
 ### Added
