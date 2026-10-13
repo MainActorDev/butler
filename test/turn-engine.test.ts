@@ -127,3 +127,16 @@ describe('crash recovery (kill -9 drill, in-memory)', () => {
     expect(revived.state(sess).activeTurnId).toBeNull(); // no lying spinner, next turn accepted
   });
 });
+
+describe('chunk cap (the 219,961-token fix)', () => {
+  it('a heading-less 255k-char file splits into capped chunks — no giant chunk survives', async () => {
+    const { structuralChunks, MAX_CHUNK_CHARS } = await import('../src/chunk.ts');
+    const big = 'static let colorRed = UIColor(red: 0.8, green: 0.1, blue: 0.1, alpha: 1)\n'.repeat(6000); // ~255k chars, no headings
+    const chunks = structuralChunks(big, 'swift');
+    expect(chunks.length).toBeGreaterThan(10);
+    expect(Math.max(...chunks.map((c) => c.content.length))).toBeLessThanOrEqual(MAX_CHUNK_CHARS + 200);
+    // headings still work normally
+    const md = structuralChunks('# A\nx\n\n# B\ny', 'markdown');
+    expect(md.map((c) => c.headingPath)).toEqual(['A', 'B']);
+  });
+});
