@@ -117,8 +117,11 @@ describe('crash recovery (kill -9 drill, in-memory)', () => {
     const sk = sink();
     sk.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't1', prompt: 'slow', refIds: [], at: 0 }, 'k1');
     sk.handle(sess, { kind: 'turn.chunk', sessionId: sess, turnId: 't1', delta: 'partial ' }, 'k2');
-    // process dies here — NO complete/fail. A NEW sink instance over the same DB:
+    // process dies here — NO complete/fail. Age the turn past the freshness window
+    // (a boot-time sweep must skip LIVE-fresh turns — the sess_e2e40228 split-brain):
     const db = (sk as unknown as { db: import('better-sqlite3').Database }).db;
+    db.prepare('UPDATE butler_turn_events SET at = at - ? WHERE session_id = ?').run(20 * 60_000, sess);
+    db.prepare('UPDATE butler_turns SET created_at = created_at - ? WHERE session_id = ?').run(20 * 60_000, sess);
     const revived = new EventSink(db);
     const evs = revived.events(sess);
     expect(evs.at(-1)?.kind).toBe('turn.failed');
@@ -138,5 +141,18 @@ describe('chunk cap (the 219,961-token fix)', () => {
     // headings still work normally
     const md = structuralChunks('# A\nx\n\n# B\ny', 'markdown');
     expect(md.map((c) => c.headingPath)).toEqual(['A', 'B']);
+  });
+});
+
+describe('split-brain guard (sess_e2e40228)', () => {
+  it('a FRESH running turn is NOT failed by a sibling boot sweep', () => {
+    const sk = sink();
+    sk.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't1', prompt: 'live', refIds: [], at: 0 }, 'k1');
+    // sibling process boots RIGHT NOW — the turn is 0ms old:
+    const db = (sk as unknown as { db: import('better-sqlite3').Database }).db;
+    const revived = new EventSink(db);
+    const st = revived.replay(sess);
+    expect(st.turns.find((t) => t.id === 't1')?.status).toBe('running'); // left alone
+    expect(revived.events(sess).at(-1)?.kind).not.toBe('turn.failed');
   });
 });

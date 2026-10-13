@@ -87,8 +87,18 @@ export class EventSink {
   /** R3 crash recovery: turns left 'running' by a dead process are marked
    *  failed with partial content preserved (their events remain — replay shows
    *  exactly how far they got). Called once at construction; idempotent. */
-  recoverOrphans(): void {
-    const rows = this.db.prepare("SELECT id, session_id FROM butler_turns WHERE status IN ('running','requested')").all() as Array<{ id: string; session_id: string }>;
+  recoverOrphans(freshMs: number = 15 * 60_000): void {
+    // FRESHNESS GUARD (split-brain fix, sess_e2e40228): a sibling process's
+    // boot-time sweep must not fail turns that are plausibly LIVE elsewhere.
+    // Only turns idle beyond the freshness window (no event for freshMs, and
+    // started more than freshMs ago) are recovered. Live turns keep appending
+    // events, so their last-event age stays small.
+    const rows = this.db.prepare(`
+      SELECT t.id, t.session_id,
+             (SELECT COALESCE(MAX(e.at), t.created_at) FROM butler_turn_events e WHERE e.session_id = t.session_id) AS last_at
+      FROM butler_turns t
+      WHERE t.status IN ('running','requested')
+        AND ? - last_at > ?`).all(Date.now(), freshMs) as Array<{ id: string; session_id: string }>;
     for (const r of rows) {
       const seq = (this.db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM butler_turn_events WHERE session_id = ?').get(r.session_id) as { m: number }).m;
       const now = Date.now();
