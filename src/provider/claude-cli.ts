@@ -197,14 +197,18 @@ export class ClaudeCliProvider implements Provider {
         // v0.5.5: init event with a non-pending MCP server = handshake won —
         // free the cold-start lane for the next concurrent spawn
         if (ev.type === 'system' && ev.subtype === 'init') {
-          // v0.5.5 verify+retry: 'pending'/'connecting' at init = the cold-start
-          // race hit THIS boot; the model would see zero tools. Kill + let
-          // complete() respawn. Connected (or no servers) frees the lane.
+          // v0.5.5 verify+retry, STRONG oracle: the init event carries the REAL
+          // tool list. If mcp servers were configured but ZERO mcp__* tools are
+          // present (or any server is still pending), this boot lost the race —
+          // the model would see no data tools. Kill + throw MCP_PENDING;
+          // complete() respawns on a cleared lane.
           const servers = (ev as unknown as { mcp_servers?: Array<{ name?: string; status?: string }> }).mcp_servers ?? [];
+          const initTools = (ev as unknown as { tools?: string[] }).tools ?? [];
+          const mcpTools = initTools.filter((t) => t.startsWith('mcp__')).length;
           const anyPending = servers.some((sv) => sv.status === 'pending' || sv.status === 'connecting');
-          if (servers.length > 0 && anyPending) {
+          if (servers.length > 0 && (anyPending || mcpTools === 0)) {
             child.kill('SIGKILL');
-            if (!settled) { settled = true; reject(new ProviderError('claude-cli MCP handshake stuck pending (cold-start race) — retrying', 'MCP_PENDING', undefined, true)); }
+            if (!settled) { settled = true; reject(new ProviderError(`claude-cli MCP boot incomplete (pending=${anyPending}, mcpTools=${mcpTools}) — cold-start race, retrying`, 'MCP_PENDING', undefined, true)); }
             return;
           }
           freeColdStart();
