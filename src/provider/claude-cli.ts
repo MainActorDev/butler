@@ -97,6 +97,33 @@ export class ClaudeCliProvider implements Provider {
     _tools: ProviderTool[],
     opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
   ): Promise<ProviderResponse> {
+    // v0.5.5: the CLI cold-start race leaves MCP servers 'pending' at init —
+    // the model would see zero tools (sess_88de6757). Serialization prevents
+    // most races; VERIFY+RETRY covers the rest: completeOnce throws
+    // MCP_PENDING (retryable) when its init event shows a pending server;
+    // kill the child and respawn on a cleared lane (max 3 attempts).
+    const mcp = (this.cfg as { mcpConfigPath?: string }).mcpConfigPath;
+    const maxAttempts = mcp ? 3 : 1;
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.completeOnce(messages, _tools, opts);
+      } catch (err) {
+        lastErr = err;
+        const retryable = err instanceof ProviderError && err.code === 'MCP_PENDING';
+        if (!retryable || attempt === maxAttempts) throw err;
+        // brief settle so the next boot starts from a calm state
+        await new Promise((r) => setTimeout(r, 1_500));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async completeOnce(
+    messages: ProviderMessage[],
+    _tools: ProviderTool[],
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
+  ): Promise<ProviderResponse> {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     // R2-F4: isolation — the caller's key addresses its OWN claude session
     const activeSession = opts.sessionKey !== undefined
@@ -121,10 +148,6 @@ export class ClaudeCliProvider implements Provider {
     const mcp = (this.cfg as { mcpConfigPath?: string }).mcpConfigPath;
     if (mcp) args.push('--mcp-config', mcp);
     if (activeSession) args.push('--resume', activeSession);
-    // v0.5.5 hardening: --mcp-config is VARIADIC ("configs...") — without an
-    // explicit terminator it can swallow the trailing prompt as another config
-    // path ("MCP config file not found: <your prompt>"). End options for real.
-    args.push('--');
 
     // conversation → a single prompt (claude -p is turn-based; the system
     // role rides --append-system-prompt to keep it out of the user turn).
@@ -147,7 +170,9 @@ export class ClaudeCliProvider implements Provider {
       // race their MCP handshakes into 'pending' (zero tools). Released on the
       // init event (handshake done) or after 20s, whichever comes first.
       const releaseColdStart = serializeColdStart(3_000);
-      const child = spawn(bin, [...args, prompt], {
+      // v0.5.5 hardening: --mcp-config is VARIADIC — an explicit terminator
+      // keeps the trailing PROMPT from being eaten as another config path.
+      const child = spawn(bin, [...args, '--', prompt], {
         stdio: ['ignore', 'pipe', 'pipe'],
         // GLM-via-claude: inject the Anthropic-protocol endpoint vars for THIS
         // subprocess only — never touches the host's ~/.claude/settings.json
@@ -172,12 +197,19 @@ export class ClaudeCliProvider implements Provider {
         // v0.5.5: init event with a non-pending MCP server = handshake won —
         // free the cold-start lane for the next concurrent spawn
         if (ev.type === 'system' && ev.subtype === 'init') {
-          // the CLI reports mcp_servers with a STATUS; 'pending' means the
-          // handshake hasn't won yet — hold the lane until connected or timeout
+          // v0.5.5 verify+retry: 'pending'/'connecting' at init = the cold-start
+          // race hit THIS boot; the model would see zero tools. Kill + let
+          // complete() respawn. Connected (or no servers) frees the lane.
           const servers = (ev as unknown as { mcp_servers?: Array<{ name?: string; status?: string }> }).mcp_servers ?? [];
           const anyPending = servers.some((sv) => sv.status === 'pending' || sv.status === 'connecting');
-          if (!anyPending) freeColdStart();
+          if (servers.length > 0 && anyPending) {
+            child.kill('SIGKILL');
+            if (!settled) { settled = true; reject(new ProviderError('claude-cli MCP handshake stuck pending (cold-start race) — retrying', 'MCP_PENDING', undefined, true)); }
+            return;
+          }
+          freeColdStart();
         }
+        if (ev.type === 'assistant') freeColdStart(); // model is running: fully booted
         // lioclaw-style live trace: ⏵ tool + arg summary, ⎿ result head
         // v0.5.3 partial stream: text_delta events ARE the live token stream.
         // The final 'assistant' event below still fires with the complete text
