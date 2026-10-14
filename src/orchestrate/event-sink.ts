@@ -79,10 +79,15 @@ export type Effect =
 export class EventSink {
   private states = new Map<string, OrchestratorState>();
 
-  constructor(private readonly db: Database.Database) {
+  constructor(private readonly db: Database.Database, opts?: { enqueueRunTurn?: boolean }) {
     db.exec(DDL);
+    // v0.5.6: hosts that run turns INLINE (the conversation transport's own
+    // runLoop) never consume runTurn effects — enqueueing them grows the outbox
+    // forever (the 63-row backlog). Default stays true (worker-based hosts).
+    this.enqueueRunTurn = opts?.enqueueRunTurn !== false;
     this.recoverOrphans();
   }
+  private readonly enqueueRunTurn: boolean;
 
   /** R3 crash recovery: turns left running by a dead process are marked
    *  failed with partial content preserved (their events remain — replay shows
@@ -171,9 +176,11 @@ export class EventSink {
     });
     txn();
     // outbox rows AFTER the txn commits (the effect worker owns retirement)
-    for (const eff of effects) {
-      if (eff.type === 'runTurn') {
-        this.db.prepare('INSERT INTO butler_outbox(id, session_id, effect_json, attempts) VALUES (?,?,?,0)').run(ULIDish(), sessionId, JSON.stringify(eff));
+    if (this.enqueueRunTurn) {
+      for (const eff of effects) {
+        if (eff.type === 'runTurn') {
+          this.db.prepare('INSERT INTO butler_outbox(id, session_id, effect_json, attempts) VALUES (?,?,?,0)').run(ULIDish(), sessionId, JSON.stringify(eff));
+        }
       }
     }
     return { events: appended, effects };

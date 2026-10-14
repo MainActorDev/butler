@@ -137,3 +137,44 @@ describe('EffectWorker drain', () => {
     expect(await worker.drain()).toBe(0);
   });
 });
+
+describe('v0.5.6 — terminal-turn effects retire without re-running (the 63-row backlog)', () => {
+  it('drain retires effects for ALREADY-TERMINAL turns and never calls the provider', async () => {
+    const sink = makeSink();
+    // a turn that completed long ago (as if the transport ran it inline)
+    sink.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't_done', prompt: 'old', refIds: [], at: 0 }, 'r1');
+    sink.handle(sess, { kind: 'turn.chunk', sessionId: sess, turnId: 't_done', delta: 'x' }, 'r2');
+    sink.handle(sess, { kind: 'turn.complete', sessionId: sess, turnId: 't_done', answer: 'done long ago' }, 'r3');
+    // a genuinely fresh pending turn that SHOULD run
+    sink.handle(sess, { kind: 'turn.request', sessionId: sess, turnId: 't_live', prompt: 'run me', refIds: [], at: 1 }, 'r4');
+    let providerCalls = 0;
+    const counting: Provider = {
+      async complete() { providerCalls += 1; return { message: { role: 'assistant', content: 'ok' }, finishReason: 'stop', usage: { promptTokens: 1, completionTokens: 1 } }; },
+      model: 'counting',
+    };
+    const worker = new EffectWorker({ sink, provider: counting, tools: [], systemPrompt: 'sys', contextWindow: 1_000_000 });
+    const ran = await worker.drain();
+    // t_done retired without a provider call; t_live ran once
+    expect(providerCalls).toBe(1);
+    expect(ran).toBeGreaterThanOrEqual(1);
+    const remaining = sink.pendingEffects().filter((e) => JSON.parse(e.effect_json).turnId === 't_done');
+    expect(remaining.length).toBe(0); // stale row retired
+  });
+});
+
+describe('v0.5.6 — inline hosts & stale backlog (the 63-row outbox)', () => {
+  it('sink with enqueueRunTurn:false never writes outbox rows (inline hosts)', () => {
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE butler_messages(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, tool_calls_json TEXT, tool_results_json TEXT, tokens_in INTEGER NOT NULL, tokens_out INTEGER NOT NULL, created_at INTEGER NOT NULL)`);
+    const sk = new EventSink(db, { enqueueRunTurn: false });
+    sk.handle('s-inline', { kind: 'turn.request', sessionId: 's-inline', turnId: 't1', prompt: 'x', refIds: [], at: 0 }, 'k1');
+    const n = (db.prepare('SELECT COUNT(*) AS n FROM butler_outbox').get() as { n: number }).n;
+    expect(n).toBe(0); // no rows enqueued for inline hosts
+    // default sink still enqueues (worker hosts unchanged)
+    const sk2 = new EventSink(db);
+    sk2.handle('s-worker', { kind: 'turn.request', sessionId: 's-worker', turnId: 't2', prompt: 'x', refIds: [], at: 0 }, 'k2');
+    const n2 = (db.prepare('SELECT COUNT(*) AS n FROM butler_outbox WHERE session_id=?').get('s-worker') as { n: number }).n;
+    expect(n2).toBe(1);
+  });
+});
+

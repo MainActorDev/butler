@@ -40,13 +40,27 @@ const COMPACT_THRESHOLD = 0.8; // auto-compact at 80% of window (plan decision 4
 export class EffectWorker {
   constructor(private readonly deps: EffectWorkerDeps) {}
 
-  /** Drain ONE pass of un-retired effects. Returns how many ran. No sleeps. */
+  /** Drain ONE pass of un-retired effects. Returns how many ran. No sleeps.
+   *
+   *  v0.5.6 (the 63-row backlog): a turn whose projection already reached a
+   *  TERMINAL state (completed/failed/aborted) is DONE — its effect is retired
+   *  without re-running. Hosts that run turns via the conversation transport
+   *  (not this worker) leave rows behind; without this guard, starting a
+   *  worker retroactively would replay every historical turn. The turn table
+   *  is the cheap oracle (one indexed lookup per row). */
   async drain(): Promise<number> {
     const pending = this.deps.sink.pendingEffects();
     let ran = 0;
     for (const row of pending) {
       const eff = JSON.parse(row.effect_json) as Effect;
       if (eff.type === 'runTurn') {
+        const st = this.deps.sink.state(eff.sessionId);
+        const turn = st.turns.find((t) => t.id === eff.turnId);
+        if (turn && turn.status !== 'requested' && turn.status !== 'running') {
+          // already terminal — retire the stale effect, never re-run
+          this.deps.sink.retire(row.id);
+          continue;
+        }
         await this.runTurn(eff.sessionId, eff.turnId);
       }
       // 'emit' effects carry no side effect for the worker (the sink emits at append)
