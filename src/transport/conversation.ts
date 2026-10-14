@@ -6,7 +6,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Storage } from '../memory/contract.ts';
 import { runLoop } from '../loop.ts';
 import type { EventSink } from '../orchestrate/event-sink.ts';
-import type { Provider } from '../provider/index.ts';
+import type { Provider, ProviderMessage, ProviderResponse, ProviderTool } from '../provider/index.ts';
 import type { Policy, ToolRegistry } from '../tools.ts';
 import type { TurnEvent } from '../loop.ts';
 import { toolFromRegistry } from './loop-adapter.ts';
@@ -35,6 +35,15 @@ export interface ConversationDeps {
   emit(event: TurnEvent & { sessionId: string }): void;
   /** streaming seam: per-session delta handler factory */
   onDelta?: (sessionId: string) => (delta: string) => void;
+  /** model routing (plan 20261014T084923Z, review PR2): when set, the transport
+   *  asks the host which model/combo serves this request body and calls the
+   *  ROUTER's route-aware complete instead of the plain provider seam. The
+   *  host returns undefined for "default". Without this, a picker UI is a
+   *  silent no-op. */
+  resolveModel?: (body: { content?: string; commands?: string[]; model?: string }) => string | undefined;
+  /** route-aware complete: produced by createModelRouter().route — invoked with
+   *  the resolved model when resolveModel returns a value. */
+  routeComplete?: (model: string | undefined) => (messages: ProviderMessage[], tools: ProviderTool[], opts: Parameters<Provider['complete']>[2]) => Promise<ProviderResponse>;
 }
 
 export interface TurnOutcome {
@@ -189,10 +198,14 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       const toolSet = overlay?.tools?.length
         ? allowedTools.filter((t) => overlay.tools!.includes(t.name))
         : allowedTools;
+      // model routing (PR2): the host resolved a model/combo for THIS body —
+      // run the loop against the router's route-aware complete
+      const routedModel = deps.resolveModel?.(b as { content?: string; commands?: string[]; model?: string }) ?? undefined;
+      const routedComplete = routedModel !== undefined && deps.routeComplete ? deps.routeComplete(routedModel) : undefined;
       const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock, b.content, {
         sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
         history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
-        provider: deps.provider,
+        provider: routedComplete ? { complete: (m, t, o) => routedComplete(m, t, o), model: routedModel ?? deps.provider.model } : deps.provider,
         tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),
         signal: ac.signal,
