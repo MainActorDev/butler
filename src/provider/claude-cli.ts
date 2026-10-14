@@ -230,9 +230,20 @@ export class ClaudeCliProvider implements Provider {
           return;
         }
         const text = result.result ?? '';
+        // v0.5.4 (the million-token silent-empty bug, sess_e2e40228): a turn can
+        // burn its whole context mid-agentic-run and the harness still reports
+        // success with an EMPTY result string — the narration that streamed live
+        // (assistant text blocks on this same stdout) is the partial work. Fall
+        // back to it: partial content beats a silent empty completion.
+        const streamedText = events
+          .filter((e) => e.type === 'assistant' && e.message?.content)
+          .flatMap((e) => (e.message?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text ?? ''))
+          .join('\n\n')
+          .trim();
+        const finalText = text.trim() ? text : streamedText;
         const u = result.usage;
         resolve({
-          message: { role: 'assistant', content: text || null },
+          message: { role: 'assistant', content: finalText || null },
           usage: u ? {
             promptTokens: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
             completionTokens: u.output_tokens ?? 0,

@@ -224,6 +224,22 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           }
         },
       });
+      // v0.5.4: an EMPTY answer after real work is not success. A turn that
+      // streamed narration or called tools and still ends with "" burned its
+      // context (the 05:46 incident: 1M tokens, 40 tool calls, answer "") —
+      // fail it honestly instead of recording a lying turn.completed. The
+      // provider-level fallback usually rescues partial text; this guard is
+      // the backstop when even that is empty.
+      const turnEvents = sink ? sink.events(id) : [];
+      const didWork = turnEvents.some((e) => e.turn_id === durableTurnId && (e.kind === 'chunk' || e.kind === 'tool_call' || e.kind === 'tool_call_update'));
+      if (!result.answer.trim() && didWork) {
+        if (sink) sink.handle(id, { kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: 'turn ended with an empty answer after processing (likely context exhaustion mid-run) — partial transcript preserved in the event log; resend to continue' }, `chat:${durableTurnId}:emptyfail`);
+        outcome.ok = false;
+        outcome.error = 'empty answer after work — turn failed honestly (see event log)';
+        await storage.updateSession(id, { status: 'error' });
+        activeTurns.delete(id);
+        return { turn: outcome };
+      }
       if (sink) sink.handle(id, { kind: 'turn.complete', sessionId: id, turnId: durableTurnId, answer: result.answer }, `chat:${durableTurnId}:done`);
       outcome.ok = true;
       outcome.answer = result.answer;
