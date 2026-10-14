@@ -67,9 +67,51 @@ function chunkTicket(text: string): Array<{ path: string; body: string }> {
   return out;
 }
 
+/** hard chunk cap (R3 fix): a structural part with no headings (generated
+ *  artifacts, minified files) would otherwise ship whole — a 255k-char
+ *  GeneratedAssetSymbols.swift became one 220k-token chunk and blew the
+ *  provider's tool-result limit. Split at line boundaries, keep the path. */
+export const MAX_CHUNK_CHARS = 12_000;
+
+function splitOversized(parts: Array<{ path: string; body: string }>): Array<{ path: string; body: string }> {
+  const out: Array<{ path: string; body: string }> = [];
+  for (const part of parts) {
+    if (part.body.length <= MAX_CHUNK_CHARS) { out.push(part); continue; }
+    let n = 0;
+    // single-line monsters (minified json) have no line boundaries: hard-slice
+    if (!part.body.includes('\n')) {
+      for (let i = 0; i < part.body.length; i += MAX_CHUNK_CHARS) {
+        n += 1;
+        out.push({ path: `${part.path} [${n}]`, body: part.body.slice(i, i + MAX_CHUNK_CHARS) });
+      }
+      continue;
+    }
+    const lines = part.body.split('\n');
+    let buf: string[] = [];
+    let size = 0;
+    for (const line of lines) {
+      if (size + line.length + 1 > MAX_CHUNK_CHARS && buf.length) {
+        n += 1;
+        out.push({ path: `${part.path} [${n}]`, body: buf.join('\n') });
+        buf = []; size = 0;
+      }
+      if (line.length > MAX_CHUNK_CHARS) { // long single line inside a multi-line doc
+        for (let i = 0; i < line.length; i += MAX_CHUNK_CHARS) {
+          n += 1;
+          out.push({ path: `${part.path} [${n}]`, body: line.slice(i, i + MAX_CHUNK_CHARS) });
+        }
+        continue;
+      }
+      buf.push(line); size += line.length + 1;
+    }
+    if (buf.length) { n += 1; out.push({ path: part.path + (n > 1 ? ` [${n}]` : ''), body: buf.join('\n') }); }
+  }
+  return out;
+}
+
 export function structuralChunks(text: string, kind: string): StructuralChunk[] {
   const parts = kind === 'diff' ? chunkDiff(text)
     : kind === 'jira-ticket' ? chunkTicket(text)
     : chunkMarkdown(text); // default: markdown-ish (headings; harmless without)
-  return parts.map((p, i) => ({ ordinal: i, headingPath: p.path, content: p.body, tokens: est(p.body) }));
+  return splitOversized(parts).map((p, i) => ({ ordinal: i, headingPath: p.path, content: p.body, tokens: est(p.body) }));
 }

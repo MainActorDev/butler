@@ -27,6 +27,11 @@ export interface ClaudeCliEvent {
   tool_use_id?: string;
   message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown; is_error?: boolean; content?: unknown }> };
   error?: string;
+  /** v0.5.3 --include-partial-messages: Anthropic SSE events wrapped by the CLI
+   *  as {type:'stream_event', event:{...}}. content_block_delta carries
+   *  text_delta (the answer tokens) and thinking_delta (reasoning, pre-answer). */
+  stream_event?: never;
+  event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string } };
 }
 
 /** lioclaw pattern: the one meaningful argument of a tool call (command,
@@ -42,6 +47,22 @@ function inputSummary(raw: unknown): string {
 }
 
 const INTERNAL_PROGRESS = new Set(['thinking_tokens', 'task_progress', 'task_started', 'background_tasks_changed']);
+
+
+/** v0.5.5 cold-start serialization: the claude CLI has a boot race when two
+ *  instances spawn at the same instant — both MCP handshakes stick 'pending'
+ *  and the models see ZERO tools (probed: solo=54 tools, simultaneous=0,
+ *  3s-staggered=54). The CLI contends on ~/.claude state during cold start;
+ *  serializing the SPAWN window (not the whole run) sidesteps it. Module-level:
+ *  applies across provider instances in one process. */
+let coldStartChain: Promise<void> = Promise.resolve();
+function serializeColdStart(gapMs: number): () => void {
+  const prev = coldStartChain;
+  let release!: () => void;
+  coldStartChain = new Promise<void>((r) => { release = r; });
+  void prev.then(() => { setTimeout(release, gapMs); });
+  return release;
+}
 
 export class ClaudeCliProvider implements Provider {
   readonly model: string;
@@ -68,10 +89,42 @@ export class ClaudeCliProvider implements Provider {
     // prompts for anything not allowlisted (headless = denied). The deny-list
     // remains the wall for Bash/Web/Task/Notebook.
     void this.cfg;
+    // v0.6.2 editor mode (cwd set = worktree turn): grant native file editing so
+    // the model applies edits inside the worktree — Bash/git stay HARD-denied;
+    // the host owns all git operations. Non-cwd turns stay read-only.
+    const cwd = (this.cfg as { cwd?: string }).cwd;
+    if (cwd) return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookRead', 'mcp__lionidas'];
     return ['Read', 'Grep', 'Glob', 'LS', 'mcp__lionidas'];
   }
 
   async complete(
+    messages: ProviderMessage[],
+    _tools: ProviderTool[],
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
+  ): Promise<ProviderResponse> {
+    // v0.5.5: the CLI cold-start race leaves MCP servers 'pending' at init —
+    // the model would see zero tools (sess_88de6757). Serialization prevents
+    // most races; VERIFY+RETRY covers the rest: completeOnce throws
+    // MCP_PENDING (retryable) when its init event shows a pending server;
+    // kill the child and respawn on a cleared lane (max 3 attempts).
+    const mcp = (this.cfg as { mcpConfigPath?: string }).mcpConfigPath;
+    const maxAttempts = mcp ? 3 : 1;
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.completeOnce(messages, _tools, opts);
+      } catch (err) {
+        lastErr = err;
+        const retryable = err instanceof ProviderError && err.code === 'MCP_PENDING';
+        if (!retryable || attempt === maxAttempts) throw err;
+        // brief settle so the next boot starts from a calm state
+        await new Promise((r) => setTimeout(r, 1_500));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async completeOnce(
     messages: ProviderMessage[],
     _tools: ProviderTool[],
     opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
@@ -83,6 +136,11 @@ export class ClaudeCliProvider implements Provider {
       : this.sessionId;
     const args: string[] = ['-p', '--bare',
       '--output-format', 'stream-json', '--verbose',
+      // v0.5.3: token-level deltas — without this flag the CLI buffers each
+      // assistant message and emits ONE complete event (the whole answer
+      // arrived as a single chunk at completion; the UI spun on dots for the
+      // entire turn). stream_event blocks carry text deltas as they generate.
+      '--include-partial-messages',
       '--permission-mode', 'acceptEdits',
       '--allowedTools', ...this.allowedTools(),
       // HARD deny — allowedTools is only a hint; disallowedTools is the wall.
@@ -113,13 +171,23 @@ export class ClaudeCliProvider implements Provider {
     const prompt = `${historyBlock}${userTurn?.content ?? ''}`;
 
     return new Promise<ProviderResponse>((resolve, reject) => {
-      const child = spawn(bin, [...args, prompt], {
+      // v0.5.5: take the cold-start lane BEFORE spawning — concurrent CLI boots
+      // race their MCP handshakes into 'pending' (zero tools). Released on the
+      // init event (handshake done) or after 20s, whichever comes first.
+      const releaseColdStart = serializeColdStart(3_000);
+      // v0.5.5 hardening: --mcp-config is VARIADIC — an explicit terminator
+      // keeps the trailing PROMPT from being eaten as another config path.
+      const child = spawn(bin, [...args, '--', prompt], {
+        cwd: (this.cfg as { cwd?: string }).cwd, // v0.6.1: worktree-mode spawns edit there
         stdio: ['ignore', 'pipe', 'pipe'],
         // GLM-via-claude: inject the Anthropic-protocol endpoint vars for THIS
         // subprocess only — never touches the host's ~/.claude/settings.json
         ...(this.cfg.env ? { env: { ...process.env, ...this.cfg.env } } : {}),
       });
       this.child = child;
+      let coldStartFreed = false;
+      const freeColdStart = (): void => { if (!coldStartFreed) { coldStartFreed = true; releaseColdStart(); } };
+      setTimeout(freeColdStart, 20_000); // backstop: never hold the lane forever
       let buf = '';
       let stderr = '';
       const events: ClaudeCliEvent[] = [];
@@ -132,7 +200,38 @@ export class ClaudeCliProvider implements Provider {
         let ev: ClaudeCliEvent;
         try { ev = JSON.parse(t) as ClaudeCliEvent; } catch { return; }
         events.push(ev);
+        // v0.5.5: init event with a non-pending MCP server = handshake won —
+        // free the cold-start lane for the next concurrent spawn
+        if (ev.type === 'system' && ev.subtype === 'init') {
+          // v0.5.5 verify+retry, STRONG oracle: the init event carries the REAL
+          // tool list. If mcp servers were configured but ZERO mcp__* tools are
+          // present (or any server is still pending), this boot lost the race —
+          // the model would see no data tools. Kill + throw MCP_PENDING;
+          // complete() respawns on a cleared lane.
+          const servers = (ev as unknown as { mcp_servers?: Array<{ name?: string; status?: string }> }).mcp_servers ?? [];
+          const initTools = (ev as unknown as { tools?: string[] }).tools ?? [];
+          const mcpTools = initTools.filter((t) => t.startsWith('mcp__')).length;
+          const anyPending = servers.some((sv) => sv.status === 'pending' || sv.status === 'connecting');
+          if (servers.length > 0 && (anyPending || mcpTools === 0)) {
+            child.kill('SIGKILL');
+            if (!settled) { settled = true; reject(new ProviderError(`claude-cli MCP boot incomplete (pending=${anyPending}, mcpTools=${mcpTools}) — cold-start race, retrying`, 'MCP_PENDING', undefined, true)); }
+            return;
+          }
+          freeColdStart();
+        }
+        if (ev.type === 'assistant') freeColdStart(); // model is running: fully booted
         // lioclaw-style live trace: ⏵ tool + arg summary, ⎿ result head
+        // v0.5.3 partial stream: text_delta events ARE the live token stream.
+        // The final 'assistant' event below still fires with the complete text
+        // — consumers must append, not replace (the transport's chunk rail is
+        // append-only by design).
+        if (ev.type === 'stream_event') {
+          const se = ev.event;
+          if (se?.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
+            opts.onDelta?.(se.delta.text); // the answer tokens, live
+          }
+          return; // thinking_delta & infrastructure events; the full assistant message still arrives
+        }
         if (ev.type === 'assistant' && ev.message?.content) {
           for (const blk of ev.message.content) {
             if (blk.type === 'text' && blk.text) {
@@ -209,9 +308,20 @@ export class ClaudeCliProvider implements Provider {
           return;
         }
         const text = result.result ?? '';
+        // v0.5.4 (the million-token silent-empty bug, sess_e2e40228): a turn can
+        // burn its whole context mid-agentic-run and the harness still reports
+        // success with an EMPTY result string — the narration that streamed live
+        // (assistant text blocks on this same stdout) is the partial work. Fall
+        // back to it: partial content beats a silent empty completion.
+        const streamedText = events
+          .filter((e) => e.type === 'assistant' && e.message?.content)
+          .flatMap((e) => (e.message?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text ?? ''))
+          .join('\n\n')
+          .trim();
+        const finalText = text.trim() ? text : streamedText;
         const u = result.usage;
         resolve({
-          message: { role: 'assistant', content: text || null },
+          message: { role: 'assistant', content: finalText || null },
           usage: u ? {
             promptTokens: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
             completionTokens: u.output_tokens ?? 0,
@@ -236,6 +346,6 @@ export class ClaudeCliProvider implements Provider {
   }
 }
 
-export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string>; mcpConfigPath?: string }): Provider {
+export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string>; mcpConfigPath?: string; cwd?: string }): Provider {
   return new ClaudeCliProvider(cfg);
 }

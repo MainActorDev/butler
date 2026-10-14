@@ -72,6 +72,7 @@ export async function fanOut(specs: ChildSpec[], deps: SupervisorDeps, parentBud
           provider: typeof deps.provider === 'function' ? deps.provider() : deps.provider,
           tools: deps.tools,
           ...(budgets[i] ? { budget: budgets[i] } : {}),
+          hardTokenCap: true, // fan-out children: deliberate per-child caps stay hard (R3 decision 4)
           onMessage: (msg, meta) => {
             void deps.storage.appendMessage({
               session_id: childId, role: msg.role, content: msg.content,

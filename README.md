@@ -187,3 +187,11 @@ pnpm check            # tsc --noEmit + vitest (mock provider — hermetic)
 Node ≥ 24.12 (better-sqlite3 ABI). Live drills: set `BUTLER_PROVIDER_BASE_URL`,
 `BUTLER_API_KEY`, `BUTLER_MODEL` (works with any OpenAI-compatible endpoint;
 verified against z.ai's coding endpoint).
+
+## Architecture (R3 — durable chat core)
+
+Turns are durable: every user message becomes a command; a PURE orchestrator decides events (no I/O); the EventSink commits events + projections + receipts + outbox in ONE sqlite transaction; the EffectWorker drains side effects and feeds results back as commands. Replay any session's event log to reproduce its state bit-for-bit.
+
+The ACP v1 wire (`createAcpAgent()`) exposes initialize/session lifecycle over JSON-RPC — in-process for Lionidas, stdio for third-party clients. `usage_update` streams both meters; compaction is visible, originals preserved.
+
+See `src/orchestrate/turn-engine.ts`, `src/orchestrate/event-sink.ts`, `src/orchestrate/effect-worker.ts`, `src/acp/`.

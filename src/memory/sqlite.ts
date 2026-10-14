@@ -118,6 +118,10 @@ export class SqliteStorage implements Storage {
   /** in-memory helper for tests */
   static memory(): SqliteStorage { return new SqliteStorage(':memory:'); }
 
+  /** R3-S5: raw handle for the EventSink (durable engine shares the DB file;
+   *  the sink owns ONLY its own tables — single-writer rule enforced by tests). */
+  handle(): Database.Database { return this.db; }
+
   private migrate(): void {
     this.db.exec(MIGRATIONS);
     // P1 D6c guarded migration: pre-existing DBs created butler_notes without

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import type { NormalizedDocument, SourceConnector } from './connector.ts';
 import { symbolChunks } from './tree-sitter.ts';
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.venv', '__pycache__', 'DerivedData']);
+const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.venv', '__pycache__', 'DerivedData', '.derived-data', '.build', 'Pods', '.swiftpm', 'buck-out']);
 const TEXT_EXT = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml', '.txt', '.css', '.scss', '.html', '.swift', '.kt', '.go', '.rs', '.py', '.rb', '.java', '.sql', '.sh']);
 
 export interface RepoSourceConfig {

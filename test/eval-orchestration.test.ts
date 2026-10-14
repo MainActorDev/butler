@@ -81,7 +81,7 @@ describe('eval-orchestration (D.0 — evals BEFORE machinery)', () => {
     const noop: LoopTool = { name: 'noop', description: 'n', parameters: { type: 'object', properties: {} }, execute: async () => 'ok' };
 
     const outcomes = await Promise.allSettled([
-      runLoop('sys', 'go', { provider: new MockProvider(big), tools: [noop], budget: { maxHops: 3, maxTokens: 500, wallMs: 10_000 } }),
+      runLoop('sys', 'go', { provider: new MockProvider(big), tools: [noop], budget: { maxHops: 3, maxTokens: 500, wallMs: 10_000 }, hardTokenCap: true }),
       runLoop('sys', 'go', { provider: new MockProvider(normal), tools: [noop], budget: { maxHops: 3, maxTokens: 500, wallMs: 10_000 } }),
     ]);
     // the fan-out did NOT abort: one rejected (BUDGET_EXCEEDED = named skip),

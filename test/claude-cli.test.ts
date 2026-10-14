@@ -9,7 +9,7 @@ import { ProviderError } from '../src/provider/types.ts';
 
 let tmp: string;
 
-function fakeClaude(behavior: 'ok' | 'die' | 'session-lost' | 'garbage'): string {
+function fakeClaude(behavior: 'ok' | 'die' | 'session-lost' | 'garbage' | 'empty-result'): string {
   const dir = mkdtempSync(join(tmpdir(), 'butler-cc-'));
   const path = join(dir, 'claude');
   const scripts: Record<string, string> = {
@@ -34,6 +34,18 @@ process.stdout.write(evts.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
 `,
     garbage: `#!/usr/bin/env node
 process.stdout.write('not json at all\\n\\n');
+`,
+    // v0.5.4 regression: the million-token silent-empty — narration streamed,
+    // tool_use blocks present, but the result event carries ""
+    'empty-result': `#!/usr/bin/env node
+const evts = [
+  { type: 'system', subtype: 'init', session_id: 's_empty' },
+  { type: 'assistant', message: { content: [{ type: 'text', text: 'Executing /author — registry first.' }] } },
+  { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'screens_registry', input: {} }] } },
+  { type: 'assistant', message: { content: [{ type: 'text', text: 'Code reads complete. Decisions locked.' }] } },
+  { type: 'result', subtype: 'success', result: '', session_id: 's_empty', usage: { input_tokens: 500000, output_tokens: 500000 } },
+];
+process.stdout.write(evts.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
 `,
   };
   writeFileSync(path, scripts[behavior]!);
@@ -89,3 +101,39 @@ setTimeout(() => process.stdout.write('{}\\n'), 60_000);
     await expect(p.complete(MSGS, [], { remainingMs: 10_000 })).rejects.toThrow(/no result event|exited/);
   });
 });
+
+describe('v0.5.4 — empty result after real work (the million-token silent-empty)', () => {
+  it('falls back to the streamed assistant text when result.result is empty', async () => {
+    const p = claudeCliProvider({ kind: 'claude-cli', baseUrl: 'x', apiKey: 'k', model: 'cc', binPath: fakeClaude('empty-result') });
+    const r = await p.complete(MSGS, [], { remainingMs: 10_000 });
+    expect(r.message.content).toContain('Executing /author');
+    expect(r.message.content).toContain('Decisions locked');
+  });
+
+  it('partial stream counts as real output — never a silent empty completion', async () => {
+    const p = claudeCliProvider({ kind: 'claude-cli', baseUrl: 'x', apiKey: 'k', model: 'cc', binPath: fakeClaude('empty-result') });
+    const deltas: string[] = [];
+    const r = await p.complete(MSGS, [], { remainingMs: 10_000, onDelta: (d) => { deltas.push(d); } });
+    expect((r.message.content ?? '').length).toBeGreaterThan(0);
+  });
+});
+
+describe('v0.6.1 — cwd option (worktree mode)', () => {
+  it('spawns the CLI with cwd set to the given directory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'butler-cwd-'));
+    const bin = join(dir, 'claude');
+    writeFileSync(bin, `#!/usr/bin/env node
+const evts = [
+  { type: 'system', subtype: 'init', session_id: 's_cwd' },
+  { type: 'result', subtype: 'success', result: process.cwd(), session_id: 's_cwd' },
+];
+process.stdout.write(evts.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
+`);
+    chmodSync(bin, 0o755);
+    const p = claudeCliProvider({ kind: 'claude-cli', baseUrl: 'x', apiKey: 'k', model: 'cc', binPath: bin, cwd: dir });
+    const r = await p.complete(MSGS, [], { remainingMs: 10_000 });
+    expect(r.message.content?.replace('/private/', '/')).toBe(dir.replace('/private/', '/')); // macOS /private symlink — same dir
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+

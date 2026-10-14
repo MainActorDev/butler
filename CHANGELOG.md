@@ -1,3 +1,24 @@
+## [0.5.0] — 2026-10-13 (R3 final)
+
+### Added (since rc)
+- Orphan recovery: turns left `running`/`requested` by a dead process are marked failed at sink construction, partial content preserved (kill -9 semantics, live-drilled).
+- Queue-drain seam: a queued followUp with no active turn starts its own turn — no stranded content after crash recovery.
+- S6: migration test from a real v0.4.2 DB snapshot (fixture), concurrency (interleaved streams serialize; two sessions zero cross-talk), perf sanity (append < 5ms avg).
+
+## [0.5.0-rc] — 2026-10-13 (R3: durable chat core + ACP v1 wire)
+
+### Added
+- Durable turn engine: `butler_turns` / `butler_turn_events` (append-only, parent_id, schema_version), pure orchestrator `decide()`, `EventSink` single-transaction commit (events + projections + receipts + outbox), `EffectWorker` drain. Crash-safe, replay-deterministic, idempotent commands.
+- ACP v1 wire: `createAcpAgent()` library + stdio transport (one implementation, two transports). initialize/session lifecycle, 14 session/update kinds validated against the vendored ACP schema, tool patches by toolCallId.
+- Budget-never-interrupts policy (operator decision): token cost meter advisory (warns via events), context meter drives auto-compaction at 80% (originals preserved), runaway guard is the only hard cost stop. Fan-out children keep deliberate hard caps (`hardTokenCap`).
+- Workflow stage turns join the durable log (optional `deps.sink`); skills replayable; run lifecycle (gates) unchanged.
+
+### Changed
+- `runLoop` token budget no longer throws for chat turns (advisory event instead); `hardTokenCap: true` restores the old contract for fan-out.
+
+### Migration
+- Existing `butler_sessions`/`butler_messages` remain readable; new turns append events. First evented turn per session writes `session.imported`.
+
 # Changelog
 
 ## v0.4.2 (2026-10-12)

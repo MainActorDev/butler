@@ -61,3 +61,10 @@ export { isQuestionPayload } from './workflow/spec.ts';
 export type { ArtifactRow } from './memory/contract.ts';
 export { claudeCliProvider, ClaudeCliProvider } from './provider/claude-cli.ts';
 export type { ClaudeCliEvent } from './provider/claude-cli.ts';
+
+export { decide, fold, initialState, TURN_EVENT_SCHEMA_VERSION } from './orchestrate/turn-engine.ts';
+export type { TurnCommand, TurnEvent as DurableTurnEvent, TurnEventKind as DurableTurnEventKind, OrchestratorState, QueueState, UsageMeters } from './orchestrate/turn-engine.ts';
+export { EventSink } from './orchestrate/event-sink.ts';
+export type { Effect, EventRow, OutboxRow } from './orchestrate/event-sink.ts';
+export { EffectWorker } from './orchestrate/effect-worker.ts';
+export type { EffectWorkerDeps } from './orchestrate/effect-worker.ts';
