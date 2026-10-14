@@ -129,7 +129,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
 
   app.post('/api/agent/sessions/:id/messages', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const b = (req.body ?? {}) as { content?: string; commands?: string[] };
+    const b = (req.body ?? {}) as { content?: string; commands?: string[]; model?: string };
     if (!b.content?.trim()) return reply.code(400).send({ error: 'content required' });
     const session = await storage.getSession(id);
     if (!session) return reply.code(404).send({ error: 'session not found' });
