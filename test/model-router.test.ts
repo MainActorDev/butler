@@ -225,10 +225,10 @@ describe('transport threading (review PR2 — the picker must not be a silent no
     const app = Fastify();
     await registerConversationApi(app, {
       storage, provider: mkProv('default'), registry: { list: () => [] } as never, policy: { allows: 'read' }, systemPrompt: 's', sink, emit: () => {},
-      resolveModel: (b) => b.model,
-      routeComplete: (model) => {
+      resolveModel: (b: { model?: string }) => b.model,
+      routeComplete: (model: string | undefined) => {
         const p = providers[model as keyof typeof providers] ?? mkProv('default');
-        return (m, t, o) => p.complete(m, t, o);
+        return (m: ProviderMessage[], t: ProviderTool[], o: Parameters<Provider["complete"]>[2]) => p.complete(m, t, o);
       },
     } as never);
     const r1 = await app.inject({ method: 'POST', url: '/api/agent/sessions/s1/messages', payload: { content: 'x', model: 'glm' } });
