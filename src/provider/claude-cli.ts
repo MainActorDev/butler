@@ -27,6 +27,9 @@ export interface ClaudeCliEvent {
   tool_use_id?: string;
   message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown; is_error?: boolean; content?: unknown }> };
   error?: string;
+  /** v0.5.3 --include-partial-messages: Anthropic SSE events wrapped by the CLI.
+   *  content_block_delta carries text_delta — the true token stream. */
+  stream_event?: { type?: string; delta?: { type?: string; text?: string }; message?: { content?: Array<{ type: string; text?: string }> } };
 }
 
 /** lioclaw pattern: the one meaningful argument of a tool call (command,
@@ -83,6 +86,11 @@ export class ClaudeCliProvider implements Provider {
       : this.sessionId;
     const args: string[] = ['-p', '--bare',
       '--output-format', 'stream-json', '--verbose',
+      // v0.5.3: token-level deltas — without this flag the CLI buffers each
+      // assistant message and emits ONE complete event (the whole answer
+      // arrived as a single chunk at completion; the UI spun on dots for the
+      // entire turn). stream_event blocks carry text deltas as they generate.
+      '--include-partial-messages',
       '--permission-mode', 'acceptEdits',
       '--allowedTools', ...this.allowedTools(),
       // HARD deny — allowedTools is only a hint; disallowedTools is the wall.
@@ -133,6 +141,17 @@ export class ClaudeCliProvider implements Provider {
         try { ev = JSON.parse(t) as ClaudeCliEvent; } catch { return; }
         events.push(ev);
         // lioclaw-style live trace: ⏵ tool + arg summary, ⎿ result head
+        // v0.5.3 partial stream: text_delta events ARE the live token stream.
+        // The final 'assistant' event below still fires with the complete text
+        // — consumers must append, not replace (the transport's chunk rail is
+        // append-only by design).
+        if (ev.type === 'stream_event' && ev.stream_event) {
+          const se = ev.stream_event;
+          if (se.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
+            opts.onDelta?.(se.delta.text);
+          }
+          return; // infrastructure events; the full assistant message still arrives
+        }
         if (ev.type === 'assistant' && ev.message?.content) {
           for (const blk of ev.message.content) {
             if (blk.type === 'text' && blk.text) {
