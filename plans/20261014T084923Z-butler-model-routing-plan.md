@@ -33,6 +33,7 @@ interface ModelDef {
   priority: number;        // lower = preferred (liorouter semantics)
   enabled: boolean;
   maxOutputTokens?: number;
+  claude?: { binPath?: string; mcpConfigPath?: string };  // claude-cli members (PR4): config by reference, same construction as today
 }
 interface ModelCombo {                     // user decision 3: model combos
   id: string;              // alias: "auto", "cheap", "smart"...
@@ -46,17 +47,21 @@ Sources, in precedence order: `BUTLER_MODELS_FILE` (JSON) → `BUTLER_MODELS` (i
 
 ```ts
 class ModelRouter implements Provider {
-  complete(messages, tools, opts & { model?: string })  // opts.model = combo/model id, default combo
+  complete(messages, tools, opts): Promise<ProviderResponse>            // default combo (Provider stays untouched)
+  route(model?: string): RoutedComplete                                 // router-LOCAL selection seam (PR1)
 }
 ```
-- Resolution: `opts.model` → combo? expand to member chain : single model. Unknown id → `PROVIDER_BAD_REQUEST` with the catalog in the message.
+- Selection is a router-local extra arg — the `Provider` interface and every adapter stay untouched (review PR1: leaking `model` into Provider opts breaks four implementations). Factory returns `{ provider, route }`; callers below (loop.ts) never know routing exists.
+- Resolution: `route(model?)` → combo? expand to member chain : single model. Unknown id → `PROVIDER_BAD_REQUEST` with the catalog in the message.
 - **Fallback chain walk** (Portkey semantics, adapted): try members by priority; retry a member per existing `RetryPolicy` when `ProviderError.retryable`; advance to next member on exhausted retries or non-retryable errors; **stop fallback after first delta emitted** (no duplicated visible text) — record `provider.fallback` events.
 - Provider events extended: `{type:'provider.route', model, combo?, attempt}` before each member attempt — the status page and pipeline logs can show which model served a turn.
 - Anthropic adapter (`src/provider/anthropic.ts`): Messages API `/v1/messages`, SSE `content_block_delta` streaming (butler already parses this exact shape for claude-cli `stream_event` — reuse the knowledge), tool use via Anthropic's `tools`/`tool_use` blocks normalized to `ProviderMessage.tool_calls`.
-- Health: per-model rolling window (last N outcomes, in-memory, surfaced via `router.health()`) — v1 status only; no auto-pause (liorouter's draining lands later).
+- Health: per-model rolling window (last N outcomes, in-memory per-process — v1 truth is process-lifetime, same as the status page's other signals; review PR5), surfaced via `router.health()` — no auto-pause (liorouter's draining lands later).
+- **Reload seam (review PR3)**: `router.reload()` re-reads the registry file and swaps model/combo maps atomically; in-flight turns keep their already-resolved chain. Lionidas routes call reload after every write — no restart, no silent staleness. Test: PUT then immediate chat uses the new registry.
 
 ### Lionidas integration
 
+- **Butler transport threading (review PR2)**: `registerConversationApi` accepts `resolveModel?: (body) => string | undefined`; when set, the transport calls the router's route-aware complete instead of the plain one. Test: two chats, different `body.model` → different served models. Without this the picker is a silent no-op.
 - Server: `GET/PUT /api/agent/models` (admin) — registry + combos read/write to the JSON file (path env), secrets masked (`apiKeyEnv` name + `present: boolean`); `GET /api/agent/models/health` (operator) — router health rollup. Chat send accepts optional `model` (combo or id) plumbed through conversation transport `complete` opts → turn events record the routed model.
 - Web: Settings page gains a "models" section (admin): model rows (id, kind, baseUrl, model, apiKeyEnv→present dot, priority, enabled toggle), combo rows (alias → ordered members), and the chat composer gains a compact model picker (combos + direct models) — selection rides each send. Sketch-first for the picker + section layouts per house rule.
 - Status page: provider·mcp card gains `routed model` + per-model health dots from `router.health()`.
@@ -78,7 +83,9 @@ class ModelRouter implements Provider {
 4. `GET/PUT /api/agent/models` CRUD works; responses never contain secret values; non-admin gets 403 (test).
 5. Chat composer model picker sends `model`; the served model is visible on the turn (event/status).
 6. Status page shows routed-model + health dots.
-7. Suites green (butler + lionidas server + web), tsc clean, live drill passes.
+7. `resolveModel` threading: different `body.model` values produce different served models (test) — the picker is wired end-to-end.
+8. `router.reload()`: registry write takes effect on the NEXT turn without restart (test).
+9. Suites green (butler + lionidas server + web), tsc clean, live drill passes.
 
 ## Out of scope (v1)
 
