@@ -9,7 +9,7 @@ import { ProviderError } from '../src/provider/types.ts';
 
 let tmp: string;
 
-function fakeClaude(behavior: 'ok' | 'die' | 'session-lost' | 'garbage'): string {
+function fakeClaude(behavior: 'ok' | 'die' | 'session-lost' | 'garbage' | 'empty-result'): string {
   const dir = mkdtempSync(join(tmpdir(), 'butler-cc-'));
   const path = join(dir, 'claude');
   const scripts: Record<string, string> = {
