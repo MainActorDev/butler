@@ -48,6 +48,22 @@ function inputSummary(raw: unknown): string {
 
 const INTERNAL_PROGRESS = new Set(['thinking_tokens', 'task_progress', 'task_started', 'background_tasks_changed']);
 
+
+/** v0.5.5 cold-start serialization: the claude CLI has a boot race when two
+ *  instances spawn at the same instant — both MCP handshakes stick 'pending'
+ *  and the models see ZERO tools (probed: solo=54 tools, simultaneous=0,
+ *  3s-staggered=54). The CLI contends on ~/.claude state during cold start;
+ *  serializing the SPAWN window (not the whole run) sidesteps it. Module-level:
+ *  applies across provider instances in one process. */
+let coldStartChain: Promise<void> = Promise.resolve();
+function serializeColdStart(gapMs: number): () => void {
+  const prev = coldStartChain;
+  let release!: () => void;
+  coldStartChain = new Promise<void>((r) => { release = r; });
+  void prev.then(() => { setTimeout(release, gapMs); });
+  return release;
+}
+
 export class ClaudeCliProvider implements Provider {
   readonly model: string;
   /** R2-F4: per-CALLER claude session map — one provider instance may serve many
@@ -105,6 +121,10 @@ export class ClaudeCliProvider implements Provider {
     const mcp = (this.cfg as { mcpConfigPath?: string }).mcpConfigPath;
     if (mcp) args.push('--mcp-config', mcp);
     if (activeSession) args.push('--resume', activeSession);
+    // v0.5.5 hardening: --mcp-config is VARIADIC ("configs...") — without an
+    // explicit terminator it can swallow the trailing prompt as another config
+    // path ("MCP config file not found: <your prompt>"). End options for real.
+    args.push('--');
 
     // conversation → a single prompt (claude -p is turn-based; the system
     // role rides --append-system-prompt to keep it out of the user turn).
@@ -123,6 +143,10 @@ export class ClaudeCliProvider implements Provider {
     const prompt = `${historyBlock}${userTurn?.content ?? ''}`;
 
     return new Promise<ProviderResponse>((resolve, reject) => {
+      // v0.5.5: take the cold-start lane BEFORE spawning — concurrent CLI boots
+      // race their MCP handshakes into 'pending' (zero tools). Released on the
+      // init event (handshake done) or after 20s, whichever comes first.
+      const releaseColdStart = serializeColdStart(3_000);
       const child = spawn(bin, [...args, prompt], {
         stdio: ['ignore', 'pipe', 'pipe'],
         // GLM-via-claude: inject the Anthropic-protocol endpoint vars for THIS
@@ -130,6 +154,9 @@ export class ClaudeCliProvider implements Provider {
         ...(this.cfg.env ? { env: { ...process.env, ...this.cfg.env } } : {}),
       });
       this.child = child;
+      let coldStartFreed = false;
+      const freeColdStart = (): void => { if (!coldStartFreed) { coldStartFreed = true; releaseColdStart(); } };
+      setTimeout(freeColdStart, 20_000); // backstop: never hold the lane forever
       let buf = '';
       let stderr = '';
       const events: ClaudeCliEvent[] = [];
@@ -142,6 +169,15 @@ export class ClaudeCliProvider implements Provider {
         let ev: ClaudeCliEvent;
         try { ev = JSON.parse(t) as ClaudeCliEvent; } catch { return; }
         events.push(ev);
+        // v0.5.5: init event with a non-pending MCP server = handshake won —
+        // free the cold-start lane for the next concurrent spawn
+        if (ev.type === 'system' && ev.subtype === 'init') {
+          // the CLI reports mcp_servers with a STATUS; 'pending' means the
+          // handshake hasn't won yet — hold the lane until connected or timeout
+          const servers = (ev as unknown as { mcp_servers?: Array<{ name?: string; status?: string }> }).mcp_servers ?? [];
+          const anyPending = servers.some((sv) => sv.status === 'pending' || sv.status === 'connecting');
+          if (!anyPending) freeColdStart();
+        }
         // lioclaw-style live trace: ⏵ tool + arg summary, ⎿ result head
         // v0.5.3 partial stream: text_delta events ARE the live token stream.
         // The final 'assistant' event below still fires with the complete text
