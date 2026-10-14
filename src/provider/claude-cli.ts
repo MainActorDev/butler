@@ -27,9 +27,11 @@ export interface ClaudeCliEvent {
   tool_use_id?: string;
   message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown; is_error?: boolean; content?: unknown }> };
   error?: string;
-  /** v0.5.3 --include-partial-messages: Anthropic SSE events wrapped by the CLI.
-   *  content_block_delta carries text_delta — the true token stream. */
-  stream_event?: { type?: string; delta?: { type?: string; text?: string }; message?: { content?: Array<{ type: string; text?: string }> } };
+  /** v0.5.3 --include-partial-messages: Anthropic SSE events wrapped by the CLI
+   *  as {type:'stream_event', event:{...}}. content_block_delta carries
+   *  text_delta (the answer tokens) and thinking_delta (reasoning, pre-answer). */
+  stream_event?: never;
+  event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string } };
 }
 
 /** lioclaw pattern: the one meaningful argument of a tool call (command,
@@ -145,12 +147,12 @@ export class ClaudeCliProvider implements Provider {
         // The final 'assistant' event below still fires with the complete text
         // — consumers must append, not replace (the transport's chunk rail is
         // append-only by design).
-        if (ev.type === 'stream_event' && ev.stream_event) {
-          const se = ev.stream_event;
-          if (se.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
-            opts.onDelta?.(se.delta.text);
+        if (ev.type === 'stream_event') {
+          const se = ev.event;
+          if (se?.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
+            opts.onDelta?.(se.delta.text); // the answer tokens, live
           }
-          return; // infrastructure events; the full assistant message still arrives
+          return; // thinking_delta & infrastructure events; the full assistant message still arrives
         }
         if (ev.type === 'assistant' && ev.message?.content) {
           for (const blk of ev.message.content) {
