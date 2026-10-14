@@ -117,3 +117,23 @@ describe('v0.5.4 — empty result after real work (the million-token silent-empt
     expect((r.message.content ?? '').length).toBeGreaterThan(0);
   });
 });
+
+describe('v0.6.1 — cwd option (worktree mode)', () => {
+  it('spawns the CLI with cwd set to the given directory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'butler-cwd-'));
+    const bin = join(dir, 'claude');
+    writeFileSync(bin, `#!/usr/bin/env node
+const evts = [
+  { type: 'system', subtype: 'init', session_id: 's_cwd' },
+  { type: 'result', subtype: 'success', result: process.cwd(), session_id: 's_cwd' },
+];
+process.stdout.write(evts.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
+`);
+    chmodSync(bin, 0o755);
+    const p = claudeCliProvider({ kind: 'claude-cli', baseUrl: 'x', apiKey: 'k', model: 'cc', binPath: bin, cwd: dir });
+    const r = await p.complete(MSGS, [], { remainingMs: 10_000 });
+    expect(r.message.content?.replace('/private/', '/')).toBe(dir.replace('/private/', '/')); // macOS /private symlink — same dir
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+

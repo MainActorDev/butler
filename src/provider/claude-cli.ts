@@ -173,6 +173,7 @@ export class ClaudeCliProvider implements Provider {
       // v0.5.5 hardening: --mcp-config is VARIADIC — an explicit terminator
       // keeps the trailing PROMPT from being eaten as another config path.
       const child = spawn(bin, [...args, '--', prompt], {
+        cwd: (this.cfg as { cwd?: string }).cwd, // v0.6.1: worktree-mode spawns edit there
         stdio: ['ignore', 'pipe', 'pipe'],
         // GLM-via-claude: inject the Anthropic-protocol endpoint vars for THIS
         // subprocess only — never touches the host's ~/.claude/settings.json
@@ -340,6 +341,6 @@ export class ClaudeCliProvider implements Provider {
   }
 }
 
-export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string>; mcpConfigPath?: string }): Provider {
+export function claudeCliProvider(cfg: ExecutorConfig & { binPath?: string; policyClass?: 'read' | 'draft' | 'act'; env?: Record<string, string>; mcpConfigPath?: string; cwd?: string }): Provider {
   return new ClaudeCliProvider(cfg);
 }
