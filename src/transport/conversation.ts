@@ -44,6 +44,15 @@ export interface ConversationDeps {
   /** route-aware complete: produced by createModelRouter().route — invoked with
    *  the resolved model when resolveModel returns a value. */
   routeComplete?: (model: string | undefined) => (messages: ProviderMessage[], tools: ProviderTool[], opts: Parameters<Provider['complete']>[2]) => Promise<ProviderResponse>;
+  /** v0.6.2 host turn-decoration (the /implement-identifiers auto flow): called
+   *  immediately before the loop runs. A returned provider REPLACES the turn's
+   *  provider (e.g. a CLI child spawned with cwd = a git worktree and edit-class
+   *  tools); promptBlock appends after the command overlay. The host owns ALL
+   *  semantics of when this fires — butler stays workflow-agnostic. */
+  prepareTurn?: (sessionId: string, body: { content: string; commands?: string[] }) => { promptBlock?: string; provider?: Provider } | null | Promise<{ promptBlock?: string; provider?: Provider } | null>;
+  /** v0.6.2: called after the turn settles (success OR failure) — the host's
+   *  post-edit window (commit/push/PR/cleanup around an editor turn). */
+  afterTurn?: (sessionId: string, outcome: { ok: boolean; turnId: string; answer: string }) => void;
 }
 
 export interface TurnOutcome {
@@ -202,10 +211,16 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       // run the loop against the router's route-aware complete
       const routedModel = deps.resolveModel?.(b as { content?: string; commands?: string[]; model?: string }) ?? undefined;
       const routedComplete = routedModel !== undefined && deps.routeComplete ? deps.routeComplete(routedModel) : undefined;
-      const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock, b.content, {
+      // v0.6.2: host decoration last — an editor-turn provider (cwd=worktree)
+      // overrides routing; the block rides AFTER the command overlay
+      let prep: { promptBlock?: string; provider?: Provider } | null = null;
+      try { prep = await deps.prepareTurn?.(id, b as { content: string; commands?: string[] }) ?? null; }
+      catch { prep = null; } // decoration failure must never kill the turn
+      const turnProvider = prep?.provider ?? (routedComplete ? { complete: (m, t, o) => routedComplete(m, t, o), model: routedModel ?? deps.provider.model } : deps.provider);
+      const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? ''), b.content, {
         sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
         history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
-        provider: routedComplete ? { complete: (m, t, o) => routedComplete(m, t, o), model: routedModel ?? deps.provider.model } : deps.provider,
+        provider: turnProvider,
         tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),
         signal: ac.signal,
@@ -260,6 +275,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       outcome.hops = result.hops;
       await storage.updateSession(id, { status: 'active', tokens_in: session.tokens_in + result.tokens.in, tokens_out: session.tokens_out + result.tokens.out });
       activeTurns.delete(id);
+      try { deps.afterTurn?.(id, { ok: true, turnId: durableTurnId, answer: result.answer }); } catch { /* host hook best-effort */ }
       return { turn: outcome };
     } catch (err) {
       const e = err as { code?: string; message?: string };
@@ -268,6 +284,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       outcome.code = e.code ?? undefined;
       await storage.updateSession(id, { status: 'error' });
       activeTurns.delete(id);
+      try { deps.afterTurn?.(id, { ok: false, turnId: durableTurnId, answer: '' }); } catch { /* host hook best-effort */ }
       return { turn: outcome }; // the turn failed; the REQUEST succeeded — outcome carries the verdict
     }
   });

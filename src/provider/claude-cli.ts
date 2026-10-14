@@ -89,6 +89,11 @@ export class ClaudeCliProvider implements Provider {
     // prompts for anything not allowlisted (headless = denied). The deny-list
     // remains the wall for Bash/Web/Task/Notebook.
     void this.cfg;
+    // v0.6.2 editor mode (cwd set = worktree turn): grant native file editing so
+    // the model applies edits inside the worktree — Bash/git stay HARD-denied;
+    // the host owns all git operations. Non-cwd turns stay read-only.
+    const cwd = (this.cfg as { cwd?: string }).cwd;
+    if (cwd) return ['Read', 'Grep', 'Glob', 'LS', 'Edit', 'Write', 'NotebookRead', 'mcp__lionidas'];
     return ['Read', 'Grep', 'Glob', 'LS', 'mcp__lionidas'];
   }
 
