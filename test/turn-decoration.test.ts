@@ -9,7 +9,7 @@ const nullProvider: Provider = {
 };
 const okProvider: Provider = {
   model: 'editor-stub',
-  complete: async (): Promise<ProviderResponse> => ({ message: { role: 'assistant', content: 'edited' }, stopReason: 'end_turn', tokens: { in: 1, out: 1 } }),
+  complete: async (): Promise<ProviderResponse> => ({ message: { role: 'assistant', content: 'edited' }, finishReason: 'end_turn', usage: { promptTokens: 1, completionTokens: 1 } }),
 };
 const failProvider: Provider = {
   model: 'failing',

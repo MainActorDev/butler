@@ -7,12 +7,13 @@ import { ModelRouter, parseRegistry, legacyRegistry, AnthropicProvider, type Reg
 import { ProviderError, type Provider, type ProviderMessage, type ProviderResponse, type ProviderTool } from '../src/provider/types.ts';
 
 const REG: Registry = {
-  version: 1,
+  version: 2,
   defaultCombo: 'auto',
+  providers: [{ id: 'mock-p', kind: 'mock', apiKeyEnv: 'K_A' }],
   models: [
-    { id: 'a', kind: 'mock', model: 'model-a', apiKeyEnv: 'K_A', priority: 1, enabled: true },
-    { id: 'b', kind: 'mock', model: 'model-b', apiKeyEnv: 'K_B', priority: 2, enabled: true },
-    { id: 'off', kind: 'mock', model: 'model-off', apiKeyEnv: 'K_C', priority: 1, enabled: false },
+    { id: 'a', provider: 'mock-p', model: 'model-a', priority: 1, enabled: true },
+    { id: 'b', provider: 'mock-p', model: 'model-b', priority: 2, enabled: true },
+    { id: 'off', provider: 'mock-p', model: 'model-off', priority: 1, enabled: false },
   ],
   combos: [
     { id: 'auto', members: ['a', 'b'], strategy: 'fallback' },
@@ -69,7 +70,7 @@ describe('registry parsing', () => {
 
   it('legacy single-model env maps to a default registry', () => {
     const r = legacyRegistry({ BUTLER_PROVIDER: 'claude-cli', BUTLER_MODEL: 'glm-5.3-flash' });
-    expect(r?.models[0]?.kind).toBe('claude-cli');
+    expect(r?.models[0]?.provider).toBe('claude-cli');
     expect(r?.defaultCombo).toBe('default');
     expect(legacyRegistry({})).toBeNull();
   });
