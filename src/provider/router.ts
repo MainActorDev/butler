@@ -1,13 +1,16 @@
-/** Model registry + router (plan 20261014T084923Z): multi-model management,
- *  combo aliases with fallback chains, two native protocols (openai chat +
- *  anthropic messages) plus the claude-cli harness as a first-class model.
- *
- *  Secrets are env-var NAMES in the registry (never values) — resolved at call
- *  time so the registry stays serializable for UI/status surfaces.
+/** Registry v2 (plan 20261019T090500Z): provider-first. Providers carry the
+ *  endpoint + key once; models reference them by id — same-provider models
+ *  stop repeating their transport config (liorouter routes[].provider /
+ *  9router provider registry pattern). parseRegistry still accepts v1 and
+ *  normalizes it (tolerant read); only v2 is ever produced (conservative
+ *  write). Secrets remain env-var NAMES, resolved at call time.
  *
  *  Routing semantics adapted from Portkey (fallback mode, retry-then-advance,
  *  NO fallback after the first emitted delta) and liorouter (priority,
- *  enabled, per-account construction). */
+ *  enabled, per-account construction). Cooldown state machine from 9router
+ *  (available / cooldown / unavailable, clearable): a failed model is skipped
+ *  by the chain for cooldownMs; if every member is cooling, the soonest-
+ *  expiring one runs — cooldown never hard-fails a route on its own. */
 
 import { readFileSync } from 'node:fs';
 import type { Provider, ProviderMessage, ProviderResponse, ProviderTool } from './types.ts';
@@ -16,12 +19,19 @@ import { OpenAICompatProvider } from './openai-compat.ts';
 import { claudeCliProvider } from './claude-cli.ts';
 import { MockProvider } from './mock.ts';
 
+export type ProviderKind = 'openai' | 'anthropic' | 'claude-cli' | 'mock';
+
+export interface ProviderDef {
+  id: string;                // referenced by models[].provider
+  kind: ProviderKind;
+  baseUrl?: string;          // required for http kinds
+  apiKeyEnv: string;         // env-var NAME (never the secret)
+}
+
 export interface ModelDef {
   id: string;
-  kind: 'openai' | 'anthropic' | 'claude-cli' | 'mock';
-  baseUrl?: string;
+  provider: string;          // → providers[].id
   model: string;
-  apiKeyEnv: string;
   priority: number;          // lower = preferred (liorouter)
   enabled: boolean;
   maxOutputTokens?: number;
@@ -35,10 +45,78 @@ export interface ModelCombo {
 }
 
 export interface Registry {
-  version: 1;
+  version: 2;
   defaultCombo: string;      // served when a caller passes nothing
+  providers: ProviderDef[];
   models: ModelDef[];
   combos: ModelCombo[];
+  cooldownMs?: number;       // failure cooldown, default 5 min
+}
+
+/** v1 input shape (flat ModelDef) — accepted on read, normalized to v2. */
+export interface ModelDefV1 {
+  id: string;
+  kind: ProviderKind;
+  baseUrl?: string;
+  model: string;
+  apiKeyEnv: string;
+  priority: number;
+  enabled: boolean;
+  maxOutputTokens?: number;
+  claude?: { binPath?: string; mcpConfigPath?: string };
+}
+
+export interface RegistryV1 {
+  version: 1;
+  defaultCombo: string;
+  models: ModelDefV1[];
+  combos: ModelCombo[];
+}
+
+const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const DEFAULT_COOLDOWN_MS = 5 * 60_000;
+
+/** provider id from a baseUrl host: api.z.ai → "zai", openrouter.ai → "openrouter" */
+function providerIdFromUrl(baseUrl?: string): string | null {
+  if (!baseUrl) return null;
+  try {
+    const labels = new URL(baseUrl).hostname.split('.').filter(Boolean);
+    while (labels.length > 2 && ['api', 'www', 'v1'].includes(labels[0]!)) labels.shift();
+    // stem = labels except TLD; if it's too short to be readable (z.ai → "z"),
+    // absorb the TLD: z.ai → "zai", x.dev → "xdev"; openrouter.ai → "openrouter"
+    let stem = (labels.length >= 2 ? labels.slice(0, -1) : labels).join('').toLowerCase().replace(/[^a-z0-9-]/g, '');
+    if (labels.length >= 2 && stem.length < 3) stem = labels.join('').toLowerCase().replace(/[^a-z0-9-]/g, '');
+    return stem && PROVIDER_ID_RE.test(stem) ? stem : null;
+  } catch { return null; }
+}
+
+function uniqueId(base: string, taken: Set<string>): string {
+  if (!taken.has(base) && PROVIDER_ID_RE.test(base)) { taken.add(base); return base; }
+  for (let i = 2; i < 100; i++) { const c = `${base}-${i}`; if (!taken.has(c)) { taken.add(c); return c; } }
+  throw new ProviderError(`cannot synthesize provider id from ${base}`, 'PROVIDER_BAD_REQUEST');
+}
+
+/** v1 flat registry → v2 provider-first (pure; table-tested). */
+export function normalizeV1(raw: RegistryV1): Registry {
+  const providers: ProviderDef[] = [];
+  const taken = new Set<string>();
+  const byKey = new Map<string, string>(); // kind|baseUrl|apiKeyEnv → provider id
+  const models: ModelDef[] = raw.models.map((m) => {
+    const key = `${m.kind}|${m.baseUrl ?? ''}|${m.apiKeyEnv}`;
+    let pid = byKey.get(key);
+    if (!pid) {
+      const base = m.kind === 'claude-cli' || m.kind === 'mock'
+        ? uniqueId(m.kind, taken)
+        : (providerIdFromUrl(m.baseUrl) ? uniqueId(providerIdFromUrl(m.baseUrl)!, taken) : uniqueId('provider', taken));
+      pid = base;
+      byKey.set(key, pid);
+      providers.push({ id: pid, kind: m.kind, ...(m.baseUrl ? { baseUrl: m.baseUrl } : {}), apiKeyEnv: m.apiKeyEnv });
+    }
+    const { kind: _k, baseUrl: _b, apiKeyEnv: _a, ...rest } = m;
+    void _k; void _b; void _a;
+    return { ...rest, provider: pid };
+  });
+  return { version: 2, defaultCombo: raw.defaultCombo, providers, models, combos: raw.combos };
 }
 
 export type RouteEvent =
@@ -46,8 +124,9 @@ export type RouteEvent =
   | { type: 'provider.response'; attempt: number; promptTokens: number; completionTokens: number; model: string };
 
 /** Rolling per-model health (process-lifetime by design — same truth class as
- *  the status page's other signals; review PR5). */
-export interface ModelHealth { id: string; ok: number; failed: number; lastError?: string; lastOkAt?: number }
+ *  the status page's other signals; review PR5). cooldownUntil set on
+ *  failure: the chain skips the model until then (9router state machine). */
+export interface ModelHealth { id: string; ok: number; failed: number; lastError?: string; lastOkAt?: number; cooldownUntil?: number }
 
 const HEALTH_WINDOW = 20;
 
@@ -63,37 +142,67 @@ export interface RouterOpts {
 }
 
 export function parseRegistry(json: string): Registry {
-  const raw = JSON.parse(json) as Partial<Registry>;
+  const raw = JSON.parse(json) as unknown as RegistryV1 | Registry;
   if (!raw.defaultCombo || !Array.isArray(raw.models) || !Array.isArray(raw.combos)) {
     throw new ProviderError('registry must have defaultCombo, models[], combos[]', 'PROVIDER_BAD_REQUEST');
   }
-  const ids = new Set(raw.models.map((m) => m.id));
-  for (const m of raw.models) {
-    if (!m.id || !m.model || typeof m.priority !== 'number') throw new ProviderError(`bad model def: ${JSON.stringify(m).slice(0, 80)}`, 'PROVIDER_BAD_REQUEST');
+  if ((raw as Registry).version === 2) {
+    const v2 = raw as Registry;
+    if (!Array.isArray(v2.providers)) throw new ProviderError('v2 registry must have providers[]', 'PROVIDER_BAD_REQUEST');
+    return validateV2(v2);
   }
-  for (const c of raw.combos) {
+  // v1 (or unversioned) → tolerant read: validate flat shape, normalize to v2
+  const v1 = raw as RegistryV1;
+  for (const m of v1.models) {
+    if (!m.id || !m.model || typeof m.priority !== 'number' || !m.kind) throw new ProviderError(`bad model def: ${JSON.stringify(m).slice(0, 80)}`, 'PROVIDER_BAD_REQUEST');
+    if (m.kind !== 'claude-cli' && m.kind !== 'mock' && !m.baseUrl) throw new ProviderError(`model ${m.id}: baseUrl required for kind ${m.kind}`, 'PROVIDER_BAD_REQUEST');
+  }
+  const normalized = normalizeV1({ ...v1, version: 1 });
+  return validateV2(normalized);
+}
+
+function validateV2(reg: Registry): Registry {
+  const ids = new Set(reg.models.map((m) => m.id));
+  const pids = new Set(reg.providers.map((p) => p.id));
+  for (const p of reg.providers) {
+    if (!p.id || !p.kind || !PROVIDER_ID_RE.test(p.id)) throw new ProviderError(`bad provider def: ${JSON.stringify(p).slice(0, 80)}`, 'PROVIDER_BAD_REQUEST');
+    if (p.kind !== 'claude-cli' && p.kind !== 'mock' && !p.baseUrl) throw new ProviderError(`provider ${p.id}: baseUrl required for kind ${p.kind}`, 'PROVIDER_BAD_REQUEST');
+  }
+  for (const m of reg.models) {
+    if (!m.id || !m.model || typeof m.priority !== 'number') throw new ProviderError(`bad model def: ${JSON.stringify(m).slice(0, 80)}`, 'PROVIDER_BAD_REQUEST');
+    if (!pids.has(m.provider)) throw new ProviderError(`model ${m.id} references unknown provider ${m.provider}`, 'PROVIDER_BAD_REQUEST');
+  }
+  for (const c of reg.combos) {
     if (!c.id || !Array.isArray(c.members) || c.members.length === 0) throw new ProviderError(`bad combo: ${c.id}`, 'PROVIDER_BAD_REQUEST');
     for (const mem of c.members) {
       if (!ids.has(mem)) throw new ProviderError(`combo ${c.id} references unknown model ${mem}`, 'PROVIDER_BAD_REQUEST');
     }
   }
-  if (!raw.combos.some((c) => c.id === raw.defaultCombo)) {
-    throw new ProviderError(`defaultCombo ${raw.defaultCombo} not in combos`, 'PROVIDER_BAD_REQUEST');
+  if (!reg.combos.some((c) => c.id === reg.defaultCombo)) {
+    throw new ProviderError(`defaultCombo ${reg.defaultCombo} not in combos`, 'PROVIDER_BAD_REQUEST');
   }
-  return { version: 1, defaultCombo: raw.defaultCombo, models: raw.models as ModelDef[], combos: raw.combos as ModelCombo[] };
+  return reg;
 }
 
-/** Legacy single-model env → registry (unchanged behavior for existing hosts). */
+/** Legacy single-model env → registry (unchanged behavior for existing hosts,
+ *  now emitted directly in the v2 shape). */
 export function legacyRegistry(env: Record<string, string | undefined>): Registry | null {
   const provider = env['BUTLER_PROVIDER'];
   const model = env['BUTLER_MODEL'];
   const baseUrl = env['BUTLER_PROVIDER_BASE_URL'];
   const apiKeyEnv = 'BUTLER_API_KEY';
   if (provider === 'claude-cli' && model) {
-    return { version: 1, defaultCombo: 'default', models: [{ id: 'primary', kind: 'claude-cli', model, apiKeyEnv, priority: 1, enabled: true, claude: { ...(env['BUTLER_CLAUDE_BIN'] ? { binPath: env['BUTLER_CLAUDE_BIN'] } : {}), ...(env['BUTLER_MCP_CONFIG'] ? { mcpConfigPath: env['BUTLER_MCP_CONFIG'] } : {}) } }], combos: [{ id: 'default', members: ['primary'], strategy: 'fallback' }] };
+    return { version: 2, defaultCombo: 'default',
+      providers: [{ id: 'claude-cli', kind: 'claude-cli', apiKeyEnv }],
+      models: [{ id: 'primary', provider: 'claude-cli', model, priority: 1, enabled: true, claude: { ...(env['BUTLER_CLAUDE_BIN'] ? { binPath: env['BUTLER_CLAUDE_BIN'] } : {}), ...(env['BUTLER_MCP_CONFIG'] ? { mcpConfigPath: env['BUTLER_MCP_CONFIG'] } : {}) } }],
+      combos: [{ id: 'default', members: ['primary'], strategy: 'fallback' }] };
   }
   if (baseUrl && model && env['BUTLER_API_KEY']) {
-    return { version: 1, defaultCombo: 'default', models: [{ id: 'primary', kind: 'openai', baseUrl, model, apiKeyEnv, priority: 1, enabled: true }], combos: [{ id: 'default', members: ['primary'], strategy: 'fallback' }] };
+    const pid = providerIdFromUrl(baseUrl) ?? 'primary';
+    return { version: 2, defaultCombo: 'default',
+      providers: [{ id: pid, kind: 'openai', baseUrl, apiKeyEnv }],
+      models: [{ id: 'primary', provider: pid, model, priority: 1, enabled: true }],
+      combos: [{ id: 'default', members: ['primary'], strategy: 'fallback' }] };
   }
   return null;
 }
@@ -120,7 +229,8 @@ export class ModelRouter implements Provider {
   }
 
   /** PR3 reload seam: re-read the registry file; in-flight turns keep their
-   *  resolved chain (they captured the provider list). */
+   *  resolved chain (they captured the provider list). Health + cooldown
+   *  persist across reloads (same truth class as the counters). */
   reload(registry?: Registry): void {
     this.registry = registry ?? loadRegistry(this.opts);
     this.providers = new Map();          // rebuild lazily; health persists
@@ -130,7 +240,21 @@ export class ModelRouter implements Provider {
 
   health(): ModelHealth[] { return [...this.healthMap.values()]; }
 
-  /** resolve a combo/model id → ordered enabled ModelDefs (fallback chain) */
+  /** UI seam: lift a model's cooldown (9router "clear cooldown"). */
+  clearCooldown(id: string): void {
+    const h = this.healthMap.get(id);
+    if (h) delete h.cooldownUntil;
+  }
+
+  private cooldownLeft(id: string): number {
+    const h = this.healthMap.get(id);
+    if (!h?.cooldownUntil) return 0;
+    return Math.max(0, h.cooldownUntil - Date.now());
+  }
+
+  /** resolve a combo/model id → ordered enabled ModelDefs (fallback chain).
+   *  Members in cooldown are skipped; if EVERY member is cooling, the
+   *  soonest-expiring one runs — cooldown never hard-fails a route alone. */
   chain(forModel?: string): ModelDef[] {
     const want = forModel ?? this.registry.defaultCombo;
     const combo = this.registry.combos.find((c) => c.id === want);
@@ -144,7 +268,9 @@ export class ModelRouter implements Provider {
       const combos = this.registry.combos.map((c) => c.id).join(', ');
       throw new ProviderError(`unknown or disabled model/combo "${want}" — models: ${catalog}; combos: ${combos}`, 'PROVIDER_BAD_REQUEST');
     }
-    return defs;
+    const active = defs.filter((d) => this.cooldownLeft(d.id) === 0);
+    if (active.length > 0) return active;
+    return [...defs].sort((a, b) => this.cooldownLeft(a.id) - this.cooldownLeft(b.id)); // all cooling → soonest first
   }
 
   /** PR1: router-LOCAL selection seam — Provider.complete stays untouched. */
@@ -162,21 +288,23 @@ export class ModelRouter implements Provider {
     const cached = this.providers.get(def.id);
     if (cached) return cached;
     const env = this.opts.env ?? process.env;
-    const apiKey = env[def.apiKeyEnv];
+    const prov = this.registry.providers.find((p) => p.id === def.provider);
+    if (!prov) throw new ProviderError(`model ${def.id}: unknown provider ${def.provider}`, 'PROVIDER_BAD_REQUEST');
+    const apiKey = env[prov.apiKeyEnv];
     let p: Provider;
-    switch (def.kind) {
+    switch (prov.kind) {
       case 'openai':
-        if (!def.baseUrl || !apiKey) throw new ProviderError(`model ${def.id}: missing baseUrl or ${def.apiKeyEnv}`, 'PROVIDER_BAD_REQUEST');
-        p = new OpenAICompatProvider({ baseUrl: def.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
+        if (!prov.baseUrl || !apiKey) throw new ProviderError(`model ${def.id} (provider ${prov.id}): missing baseUrl or ${prov.apiKeyEnv}`, 'PROVIDER_BAD_REQUEST');
+        p = new OpenAICompatProvider({ baseUrl: prov.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
         break;
       case 'anthropic':
-        if (!def.baseUrl || !apiKey) throw new ProviderError(`model ${def.id}: missing baseUrl or ${def.apiKeyEnv}`, 'PROVIDER_BAD_REQUEST');
-        p = new AnthropicProvider({ baseUrl: def.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
+        if (!prov.baseUrl || !apiKey) throw new ProviderError(`model ${def.id} (provider ${prov.id}): missing baseUrl or ${prov.apiKeyEnv}`, 'PROVIDER_BAD_REQUEST');
+        p = new AnthropicProvider({ baseUrl: prov.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
         break;
       case 'claude-cli':
         p = claudeCliProvider({
           kind: 'claude-cli',
-          baseUrl: def.baseUrl ?? '',
+          baseUrl: prov.baseUrl ?? '',
           apiKey: apiKey ?? '',
           model: def.model,
           ...(def.claude?.binPath ? { binPath: def.claude.binPath } : {}),
@@ -194,8 +322,11 @@ export class ModelRouter implements Provider {
 
   private noteHealth(id: string, ok: boolean, err?: string): void {
     const h = this.healthMap.get(id) ?? { id, ok: 0, failed: 0 };
-    if (ok) { h.ok += 1; h.lastOkAt = Date.now(); delete h.lastError; }
-    else { h.failed += 1; if (err) h.lastError = err.slice(0, 160); }
+    if (ok) { h.ok += 1; h.lastOkAt = Date.now(); delete h.lastError; delete h.cooldownUntil; }
+    else {
+      h.failed += 1; if (err) h.lastError = err.slice(0, 160);
+      h.cooldownUntil = Date.now() + (this.registry.cooldownMs ?? DEFAULT_COOLDOWN_MS);
+    }
     this.healthMap.set(id, h);
     // rolling window: keep the smaller bucket from growing unbounded
     if (h.ok + h.failed > HEALTH_WINDOW * 10) { h.ok = Math.min(h.ok, HEALTH_WINDOW); h.failed = Math.min(h.failed, HEALTH_WINDOW); }
@@ -372,4 +503,33 @@ export class AnthropicProvider implements Provider {
 export function createModelRouter(opts: RouterOpts): { provider: Provider; router: ModelRouter; route: ModelRouter['route'] } {
   const router = new ModelRouter(opts);
   return { provider: router, router, route: (m?: string) => router.route(m) };
+}
+
+/** Catalog discovery (9router modelsFetcher pattern): list a provider's
+ *  models straight from the provider. openai kinds → GET {baseUrl}/models;
+ *  anthropic → GET {baseUrl}/v1/models; CLI/mock kinds are unsupported.
+ *  Never throws — the verdict rides the body. */
+export async function fetchProviderCatalog(
+  p: Pick<ProviderDef, 'id' | 'kind' | 'baseUrl' | 'apiKeyEnv'>,
+  env: Record<string, string | undefined> = process.env,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ supported: boolean; models: string[]; error?: string }> {
+  if (p.kind === 'claude-cli' || p.kind === 'mock') return { supported: false, models: [] };
+  const key = env[p.apiKeyEnv];
+  if (!key || !p.baseUrl) return { supported: true, models: [], error: !p.baseUrl ? 'provider has no baseUrl' : `env var '${p.apiKeyEnv}' not set` };
+  const base = p.baseUrl.replace(/\/+$/, '');
+  const url = p.kind === 'anthropic' ? `${base}/v1/models` : `${base}/models`;
+  const headers = p.kind === 'anthropic'
+    ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' }
+    : { authorization: `Bearer ${key}` };
+  try {
+    const r = await fetchImpl(url, { headers, signal: AbortSignal.timeout(10_000) });
+    if (!r.ok) return { supported: true, models: [], error: `HTTP ${r.status}: ${(await r.text().catch(() => '')).slice(0, 120)}` };
+    const b = (await r.json()) as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
+    const arr = b.data ?? b.models ?? [];
+    const ids = arr.map((x) => (typeof x === 'string' ? x : x.id)).filter((x): x is string => typeof x === 'string' && x.length > 0);
+    return { supported: true, models: ids };
+  } catch (e) {
+    return { supported: true, models: [], error: e instanceof Error ? e.message : String(e) };
+  }
 }
