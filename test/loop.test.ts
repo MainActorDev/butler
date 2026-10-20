@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MockProvider, type ScriptedTurn } from '../src/provider/mock.ts';
-import { ProviderError } from '../src/provider/types.ts';
+import { ProviderError, type Provider } from '../src/provider/types.ts';
 import { runLoop, LoopError, type LoopTool, type TurnEvent } from '../src/loop.ts';
 
 const toolCall = (id: string, name: string, args: unknown): ScriptedTurn => ({
@@ -163,5 +163,23 @@ describe('loop — budgets (condition 2)', () => {
     const provider = new MockProvider([{ kind: 'error', error: new ProviderError('bad key', 'PROVIDER_BAD_REQUEST', 401, false) }]);
     const err = await runLoop('sys', 'go', { provider, tools: [] }).catch((e: unknown) => e);
     expect((err as LoopError).message).toContain('PROVIDER_BAD_REQUEST');
+  });
+});
+
+
+// ── butler#8 defensive twin: resolve-after-abort is still an abort ──
+describe('loop abort classification (#8)', () => {
+  it('provider resolving (not rejecting) after caller abort → LoopError ABORTED', async () => {
+    const ac = new AbortController();
+    const resolveLater: Provider = {
+      model: 'test-model',
+      async complete() {
+        await new Promise((r) => setTimeout(r, 150));
+        ac.abort(); // caller aborts while the "provider" is finishing
+        return { message: { role: 'assistant', content: '' }, usage: null, finishReason: 'stop' };
+      },
+    };
+    await expect(runLoop('sys', 'go', { provider: resolveLater, tools: [], budget: { maxHops: 2, maxTokens: 1000, wallMs: 10_000 }, signal: ac.signal }))
+      .rejects.toMatchObject({ code: 'ABORTED' });
   });
 });

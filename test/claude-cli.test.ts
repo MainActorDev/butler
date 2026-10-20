@@ -9,7 +9,7 @@ import { ProviderError } from '../src/provider/types.ts';
 
 let tmp: string;
 
-function fakeClaude(behavior: 'ok' | 'die' | 'session-lost' | 'garbage' | 'empty-result'): string {
+function fakeClaude(behavior: 'ok' | 'die' | 'session-lost' | 'garbage' | 'empty-result' | 'abort-empty'): string {
   const dir = mkdtempSync(join(tmpdir(), 'butler-cc-'));
   const path = join(dir, 'claude');
   const scripts: Record<string, string> = {
@@ -46,6 +46,19 @@ const evts = [
   { type: 'result', subtype: 'success', result: '', session_id: 's_empty', usage: { input_tokens: 500000, output_tokens: 500000 } },
 ];
 process.stdout.write(evts.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
+`,
+    // butler#8: mimics the REAL claude CLI on interrupt — traps SIGINT,
+    // emits a success result event with EMPTY text, exits 0. The provider
+    // must classify this as an abort (signal.aborted), never resolve it.
+    'abort-empty': `#!/usr/bin/env node
+const init = [{ type: 'system', subtype: 'init', session_id: 's_abort' }];
+process.stdout.write(init.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
+process.on('SIGINT', () => {
+  const out = [{ type: 'result', subtype: 'success', result: '', session_id: 's_abort' }];
+  process.stdout.write(out.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
+  process.exit(0);
+});
+setTimeout(() => {}, 30000);
 `,
   };
   writeFileSync(path, scripts[behavior]!);
@@ -137,3 +150,18 @@ process.stdout.write(evts.map((e) => JSON.stringify(e)).join('\\n') + '\\n');
   });
 });
 
+
+
+// ── butler#8: abort mid-flight classifies as ABORTED, not empty-answer ──
+describe('claude-cli abort classification (#8)', () => {
+  it('interrupted CLI (empty result, exit 0) rejects with ABORTED when the signal fired', async () => {
+    const bin = fakeClaude('abort-empty');
+    const provider = claudeCliProvider({ kind: 'claude-cli', baseUrl: 'http://x', apiKey: 'k', model: 'm', binPath: bin });
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 250); // interrupt after init, before nothing
+    await expect(provider.complete(MSGS, [], { remainingMs: 60_000, signal: ac.signal })).rejects.toMatchObject({
+      name: 'ProviderError',
+      code: 'ABORTED',
+    });
+  });
+});

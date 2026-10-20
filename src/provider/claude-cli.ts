@@ -288,6 +288,14 @@ export class ClaudeCliProvider implements Provider {
         clearTimeout(timer);
         if (settled) return; settled = true;
         if (buf.trim()) onLine(buf); // final unterminated line
+        // butler#8: an interrupted CLI exits 0 with a result event carrying
+        // EMPTY text — resolving that made the caller's abort look like an
+        // empty answer (turn.failed) instead of the clean ABORTED outcome.
+        // The caller aborted: reject, let the loop's signal-aware catch map it.
+        if (opts.signal?.aborted) {
+          reject(new ProviderError(`claude-cli aborted by caller (exit ${code})`, 'ABORTED', undefined, false));
+          return;
+        }
         const init = events.find((e) => e.type === 'system' && e.session_id);
         if (init?.session_id) {
           if (opts.sessionKey !== undefined) this.sessionIds.set(opts.sessionKey, init.session_id);

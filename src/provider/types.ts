@@ -1,6 +1,6 @@
 /** Provider errors — typed, distinguishable by the loop and callers. */
 export class ProviderError extends Error {
-  constructor(message: string, readonly code: 'PROVIDER_UNAVAILABLE' | 'PROVIDER_TIMEOUT' | 'PROVIDER_BAD_REQUEST' | 'MCP_PENDING', readonly status?: number, readonly retryable = false) {
+  constructor(message: string, readonly code: 'PROVIDER_UNAVAILABLE' | 'PROVIDER_TIMEOUT' | 'PROVIDER_BAD_REQUEST' | 'MCP_PENDING' | 'ABORTED', readonly status?: number, readonly retryable = false) {
     super(message);
     this.name = 'ProviderError';
   }
