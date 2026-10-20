@@ -113,6 +113,11 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
       throw new LoopError(msg, 'BUDGET_EXCEEDED', messages);
     }
 
+    // butler#8 (defensive twin): a provider that RESOLVES after the caller
+    // aborted (claude-cli exits 0 with an empty result on interrupt) is still
+    // an abort, not an empty answer — classify before touching the result.
+    if (deps.signal?.aborted) throw new LoopError('aborted by caller', 'ABORTED', messages);
+
     if (res.usage) { tokens.in += res.usage.promptTokens; tokens.out += res.usage.completionTokens; }
     messages.push(res.message);
     deps.onMessage?.(res.message, { hop, tokensIn: res.usage?.promptTokens ?? 0, tokensOut: res.usage?.completionTokens ?? 0 });
