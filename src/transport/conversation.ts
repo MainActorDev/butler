@@ -31,6 +31,10 @@ export interface ConversationDeps {
   /** R2-F3: note embedder — enables ranked note injection (falls back to recency) */
   embedder?: EmbeddingProvider;
   budget?: { maxHops?: number; maxTokens?: number; wallMs?: number };
+  /** #7: opt-in — abort the active turn when the requesting client disconnects
+   *  mid-flight (tab close, network drop). Off by default: proxied long-poll
+   *  deployments where socket close is routine must not trip it. */
+  abortOnDisconnect?: boolean;
   /** consumer's event sink (WS bus in the demo; anything callable) */
   emit(event: TurnEvent & { sessionId: string }): void;
   /** streaming seam: per-session delta handler factory */
@@ -171,6 +175,17 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     const outcome: TurnOutcome = { sessionId: id, ok: false, tokens: { in: 0, out: 0 }, hops: 0 };
     const ac = new AbortController();
     activeTurns.set(id, ac);
+    // #7: client disconnect mid-flight aborts the turn. The seam is the
+    // RESPONSE stream: req.raw 'close' fires when the request body completes
+    // (not socket death); reply.raw 'close' with !writableEnded = the client
+    // vanished before the answer was flushed. The map-identity guard makes
+    // the normal post-response close (which fires after activeTurns.delete)
+    // a no-op.
+    if (deps.abortOnDisconnect) {
+      reply.raw.on('close', () => {
+        if (!reply.raw.writableEnded && activeTurns.get(id) === ac) ac.abort();
+      });
+    }
     try {
       // core-side note injection (review F3): active notes ride the system
       // prompt, provenance-marked — knowledge crosses sessions
