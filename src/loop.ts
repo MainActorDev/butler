@@ -85,8 +85,11 @@ export interface LoopDeps {
   onDelta?: (delta: string) => void;
   /** R2-F4: provider-scoped session key (claude-cli --resume isolation) */
   sessionKey?: string;
-  /** structured tool events (claude-cli harness + registry loop) */
-  onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void;
+  /** structured tool events (claude-cli harness + registry loop).
+   *  invocationId: the provider-NATIVE call id when one exists (runtime
+   *  registry tools carry it from the assistant tool_calls); durability keys
+   *  per INVOCATION, never per tool name. */
+  onTool?: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => void;
   /** R3 decision 4: opt INTO the hard token cap (fan-out children); default advisory */
   hardTokenCap?: boolean;
   signal?: AbortSignal;
@@ -126,7 +129,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     try {
       // streaming: the EVENT always flows (WS UIs); the direct callback stays
       // opt-in for hosts that want it without the event bus
-      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => { deps.onTool?.(e); deps.onEvent?.({ type: 'turn.tool', hop, detail: e }); } });
+      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => { deps.onTool?.(e); deps.onEvent?.({ type: 'turn.tool', hop, detail: e }); } });
     } catch (err) {
       // F3 classification, by precedence: an observed caller abort wins
       // (explicit Stop beats everything, even a concurrent wall expiry), then
@@ -204,7 +207,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
       // ride the SAME durable seam as streamed harness tools — the loop emits
       // per-invocation call/result callbacks so the transport's durable path
       // records them (previously runtime tools produced ZERO durable events).
-      deps.onTool?.({ phase: 'call', name: call.function.name, arg: call.function.arguments });
+      deps.onTool?.({ phase: 'call', name: call.function.name, invocationId: call.id, arg: call.function.arguments });
       let obs: string;
       let toolFailed = false;
       try {
@@ -214,7 +217,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
         obs = `error: ${err instanceof Error ? err.message : String(err)}`;
         toolFailed = true;
       }
-      deps.onTool?.({ phase: 'result', name: call.function.name, result: obs, isError: toolFailed });
+      deps.onTool?.({ phase: 'result', name: call.function.name, invocationId: call.id, result: obs, isError: toolFailed });
       const msg: ProviderMessage = { role: 'tool', content: obs, tool_call_id: call.id };
       messages.push(msg);
       deps.onMessage?.(msg, { hop, tokensIn: 0, tokensOut: 0 });

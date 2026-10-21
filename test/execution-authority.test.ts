@@ -239,6 +239,46 @@ describe('F2 — reads and lifecycle', () => {
     await auth.drain();
   });
 
+  it('finalizeOwned commits terminal + accounting + ledger settle atomically; duplicates are no-ops', async () => {
+    const r = rig('finalize');
+    const auth = await elect(r);
+    const attempt = await admittedTurn(r, auth, 'sess_fin');
+    await auth.beginExecution(attempt);
+    const fin = await auth.finalizeOwned(attempt, {
+      kind: 'turn.complete', answer: 'all done', commandKey: `chat:${attempt.turnId}:done`, settleCode: 'COMPLETED',
+      accounting: { status: 'active', tokensInDelta: 7, tokensOutDelta: 3 },
+    });
+    expect(fin).toMatchObject({ status: 'finalized', accounted: true });
+    // one terminal event; fold terminal; accounting applied; ledger settled
+    expect(r.sink.events('sess_fin').filter((e) => e.kind === 'turn.completed')).toHaveLength(1);
+    expect(r.sink.readSnapshot('sess_fin').state.activeTurnId).toBeNull();
+    const sess = await r.storage.getSession('sess_fin');
+    expect(sess?.tokens_in).toBe(7);
+    expect(sess?.tokens_out).toBe(3);
+    expect(auth.readSession('sess_fin')).toMatchObject({ state: 'idle', admission: 'ready' });
+    // duplicate finalize (already released) is stale — never a second terminal
+    const dup = await auth.finalizeOwned(attempt, { kind: 'turn.fail', error: 'x', commandKey: `chat:${attempt.turnId}:done`, settleCode: 'X' });
+    expect(dup.status).toBe('stale');
+    expect(r.sink.events('sess_fin').filter((e) => e.kind === 'turn.failed')).toHaveLength(0);
+    await auth.drain();
+  });
+
+  it('finalizeOwned budget failure stashes the continuation INSIDE the same commit', async () => {
+    const r = rig('finbudget');
+    const auth = await elect(r);
+    const attempt = await admittedTurn(r, auth, 'sess_fb');
+    await auth.beginExecution(attempt);
+    await auth.finalizeOwned(attempt, {
+      kind: 'turn.fail', error: 'ran out of runway', commandKey: `chat:${attempt.turnId}:fail`, settleCode: 'BUDGET_EXCEEDED',
+      stash: { json: '[{"role":"tool","content":"partial"}]' },
+      accounting: { status: 'active' },
+    });
+    const stash = await r.storage.peekPartial?.('sess_fb');
+    expect(stash?.turnId).toBe(attempt.turnId); // stash + terminal + settle committed together
+    expect(r.sink.events('sess_fb').filter((e) => e.kind === 'turn.failed')).toHaveLength(1);
+    await auth.drain();
+  });
+
   it('drain awaits tracked workers before releasing the lock', async () => {
     const r = rig('drain');
     const auth = await elect(r);

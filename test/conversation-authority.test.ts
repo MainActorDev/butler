@@ -38,6 +38,44 @@ interface Rig {
   baseUrl: (app: Fastify.FastifyInstance) => string;
 }
 
+describe('authority-driven transport — drainable host tails', () => {
+  it('an afterTurn promise is a tracked worker: the POST returns first, drain awaits the tail', async () => {
+    let tailDone = false;
+    const provider = new SlowProvider(10);
+    const dir = mkdtempSync(join(tmpdir(), 'butler-conv-auth-tail-'));
+    dirs.push(dir);
+    const agent = join(dir, 'agent.db');
+    const storage = new SqliteStorage(agent);
+    const sink = new EventSink(storage['db'] as InstanceType<typeof Database>, { passive: true, enqueueRunTurn: false });
+    const auth = await createSqliteExecutionAuthority({ dbPath: agent, sink, storage });
+    const app = Fastify();
+    const registry = new ToolRegistry().register({
+      name: 'nop', description: 'n', permission: 'read', parameters: { type: 'object', properties: {} },
+      execute: async () => 'observation',
+    });
+    await registerConversationApi(app, {
+      storage, provider, registry, policy: { name: 'draft', allows: 'draft' },
+      systemPrompt: 'sys', emit: () => undefined, execution: auth,
+      afterTurn: async () => { await new Promise((res) => setTimeout(res, 120)); tailDone = true; },
+    });
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const url = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
+    try {
+      const sid = (await (await fetch(`${url}/api/agent/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).json() as { session: { id: string } }).session.id;
+      const res = await fetch(`${url}/api/agent/sessions/${sid}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'work then tail' }) });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { turn: { ok: boolean } }).turn.ok).toBe(true);
+      expect(tailDone).toBe(false); // the envelope did NOT wait for the tail
+      await auth.drain(); // normal shutdown drains the tail before releasing the lock
+      expect(tailDone).toBe(true);
+    } finally {
+      await app.close();
+      await auth.drain();
+      storage.close();
+    }
+  });
+});
+
 async function bootRig(name: string, provider: Provider): Promise<Rig & { app: Fastify.FastifyInstance; url: string }> {
   const dir = mkdtempSync(join(tmpdir(), `butler-conv-auth-${name}-`));
   dirs.push(dir);

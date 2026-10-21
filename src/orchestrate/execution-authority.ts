@@ -300,6 +300,54 @@ export class ExecutionAuthority {
     this.releaseAttempt(attempt);
   }
 
+  /** chat-reliability §3.5: OWNED ATOMIC FINALIZATION — terminal event,
+   *  projections, session accounting, budget stash and the execution-ledger
+   *  settle commit in ONE sink-connection transaction. Exact duplicate
+   *  finalize is a no-op (engine terminality guard returns no events →
+   *  already-terminal; the ledger still reconciles). A storage failure rolls
+   *  everything back and leaves the attempt reserved for an idempotent retry
+   *  — success is never reported for an uncommitted terminal. */
+  async finalizeOwned(
+    attempt: ExecutionAttempt,
+    input: {
+      kind: 'turn.complete' | 'turn.fail';
+      answer?: string;
+      error?: string;
+      commandKey: string;
+      settleCode: string;
+      accounting?: { status?: 'active' | 'ended' | 'error'; tokensInDelta?: number; tokensOutDelta?: number };
+      stash?: { json: string };
+    },
+  ): Promise<{ status: 'finalized' | 'already-terminal' | 'stale'; accounted: boolean }> {
+    if (!this.owns(attempt)) return { status: 'stale', accounted: false };
+    let accounted = false;
+    let wroteTerminal = false;
+    try {
+      this.sink.withTransaction((db) => {
+        const auth = db.prepare('SELECT epoch FROM butler_execution_authority WHERE singleton = 1').get() as { epoch: string } | undefined;
+        if (!auth || auth.epoch !== this.epoch) throw new Error('stale authority epoch');
+        const cmd: TurnCommand = (input.kind === 'turn.complete'
+          ? { kind: 'turn.complete', sessionId: attempt.sessionId, turnId: attempt.turnId, answer: input.answer ?? '' }
+          : { kind: 'turn.fail', sessionId: attempt.sessionId, turnId: attempt.turnId, error: input.error ?? 'turn failed' }) as TurnCommand;
+        const { events } = this.sink.handleInTransaction(attempt.sessionId, cmd, input.commandKey, undefined);
+        wroteTerminal = events.some((e) => e.kind === 'turn.completed' || e.kind === 'turn.failed');
+        if (input.stash) this.storage.stashPartialSync?.(attempt.sessionId, attempt.turnId, input.stash.json);
+        if (input.accounting) {
+          this.storage.applyAccountingSync?.(attempt.sessionId, input.accounting);
+          accounted = true;
+        }
+        db.prepare("UPDATE butler_executions SET phase = 'settled', terminal_code = ?, settled_at = ? WHERE turn_id = ? AND epoch = ? AND phase != 'settled'")
+          .run(input.settleCode, Date.now(), attempt.turnId, this.epoch);
+      });
+    } catch (err) {
+      this.sink.invalidate(attempt.sessionId);
+      throw err; // attempt stays reserved: retry this idempotent finalization only
+    }
+    this.sink.invalidate(attempt.sessionId);
+    this.releaseAttempt(attempt);
+    return { status: wroteTerminal ? 'finalized' : 'already-terminal', accounted };
+  }
+
   /** Release the in-process reservation ONLY if the identity still matches. */
   releaseAttempt(attempt: ExecutionAttempt): void {
     if (this.active.get(attempt.sessionId) === attempt) this.active.delete(attempt.sessionId);

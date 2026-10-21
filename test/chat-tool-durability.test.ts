@@ -79,6 +79,34 @@ describe('runtime tool durability', () => {
     }
   });
 
+  it('two same-name invocations in one turn stay DISTINCT durable calls (per-invocation identity)', async () => {
+    const provider = new AnsweringProvider([
+      { toolCalls: [
+        { id: 'call_one', type: 'function', function: { name: 'probe', arguments: '{"q":"one"}' } },
+        { id: 'call_two', type: 'function', function: { name: 'probe', arguments: '{"q":"two"}' } },
+      ] },
+      { content: 'ran it twice' },
+    ]);
+    const rig = await boot(provider);
+    try {
+      const created = await (await fetch(`${rig.url}/api/agent/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).json() as { session: { id: string } };
+      const res = await fetch(`${rig.url}/api/agent/sessions/${created.session.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'run probe twice' }) });
+      expect(res.status).toBe(200);
+      const events = rig.sink.events(created.session.id);
+      const calls = events.filter((e) => e.kind === 'tool_call');
+      const updates = events.filter((e) => e.kind === 'tool_call_update');
+      expect(calls).toHaveLength(2); // PREVIOUSLY 1 — name-derived identity collapsed invocations
+      expect(new Set(calls.map((c) => (c.detail as { toolCallId?: string }).toolCallId)).size).toBe(2);
+      expect(updates).toHaveLength(2);
+      const args = calls.map((c) => (c.detail as { arg?: string }).arg);
+      expect(args).toContain('{"q":"one"}');
+      expect(args).toContain('{"q":"two"}');
+    } finally {
+      await rig.app.close();
+      rig.storage.close();
+    }
+  });
+
   it('a failed tool handler records an isError update, never a silent success', async () => {
     const provider = new AnsweringProvider([
       { toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"boom"}' } }] },

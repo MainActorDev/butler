@@ -57,8 +57,11 @@ export interface ConversationDeps {
    *  semantics of when this fires — butler stays workflow-agnostic. */
   prepareTurn?: (sessionId: string, body: { content: string; commands?: string[] }) => { promptBlock?: string; provider?: Provider } | null | Promise<{ promptBlock?: string; provider?: Provider } | null>;
   /** v0.6.2: called after the turn settles (success OR failure) — the host's
-   *  post-edit window (commit/push/PR/cleanup around an editor turn). */
-  afterTurn?: (sessionId: string, outcome: { ok: boolean; turnId: string; answer: string }) => void;
+   *  post-edit window (commit/push/PR/cleanup around an editor turn).
+   *  chat-reliability: may return a Promise — the POST NEVER awaits it, but
+   *  under an execution authority the tail is registered as a tracked worker
+   *  so normal shutdown drains it before releasing ownership. */
+  afterTurn?: (sessionId: string, outcome: { ok: boolean; turnId: string; answer: string }) => void | Promise<void>;
   /** chat-reliability F1/F2: durable execution authority. When set, message
    *  admission is cross-process atomic (control-DB election + one-transaction
    *  durable admission), Stop targets the owned attempt, and the session read
@@ -169,6 +172,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     if (!b.content?.trim()) return reply.code(400).send({ error: 'content required' });
     const session = await storage.getSession(id);
     if (!session) return reply.code(404).send({ error: 'session not found' });
+    const content = b.content; // narrowed string (validated above) — safe in closures
     const exec = deps.execution ?? null;
     // F1 (chat-reliability): check-and-acquire is atomic — no await between
     // check and acquire — and the reservation precedes every durable write,
@@ -185,7 +189,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       if (res.status === 'busy') return reply.code(409).send({ error: 'turn already in flight on this session', ...(res.turnId !== undefined ? { turnId: res.turnId } : {}) });
       if (res.status === 'unavailable') return reply.code(503).send({ error: `chat execution unavailable (${res.reason}) — try again later`, code: res.reason });
       const attempt = res.attempt;
-      const adm = exec.admit(attempt, { content: b.content, principalId: session.user_id ?? 'anonymous', ...(b.clientRequestId !== undefined ? { requestId: b.clientRequestId } : {}) });
+      const adm = exec.admit(attempt, { content, principalId: session.user_id ?? 'anonymous', ...(b.clientRequestId !== undefined ? { requestId: b.clientRequestId } : {}) });
       if (adm.status !== 'admitted') {
         if (adm.code === 'REQUEST_ALREADY_ADMITTED') return reply.code(409).send({ error: 'request already admitted', code: adm.code, ...(adm.turnId !== undefined ? { turnId: adm.turnId } : {}) });
         if (adm.code === 'REQUEST_ID_REUSE') return reply.code(409).send({ error: 'client request id was already used with different content', code: adm.code });
@@ -225,13 +229,13 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       // R3 queue-drain: a followUp message queued against an earlier (now-dead)
       // turn starts ITS OWN turn — the queue must never strand content silently.
       const st = deps.sink.state(id);
-      const queuedIdx = st.queue.followUp.indexOf(b.content);
+      const queuedIdx = st.queue.followUp.indexOf(content);
       const noActive = st.activeTurnId === null;
       if (queuedIdx !== -1 && noActive) {
         // drain: this request IS the queued message → run as the next turn
         deps.sink.handle(id, { kind: 'message.queue', sessionId: id, content: b.content, disposition: 'steering' }, `chat:${id}:${durableTurnId}:dequeue`);
       }
-      deps.sink.handle(id, { kind: 'turn.request', sessionId: id, turnId: durableTurnId, prompt: b.content, refIds: [], at: Date.now() }, `chat:${id}:${durableTurnId}`);
+      deps.sink.handle(id, { kind: 'turn.request', sessionId: id, turnId: durableTurnId, prompt: content, refIds: [], at: Date.now() }, `chat:${id}:${durableTurnId}`);
     } else {
       await storage.appendMessage({ session_id: id, role: 'user', content: b.content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
     }
@@ -274,6 +278,16 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       if (exec && ownedAttempt) await exec.settle(ownedAttempt, code);
       else activeTurns.delete(id);
     };
+    // host tail: fire-and-forget for the POST, but DRAINABLE under an
+    // authority (tracked worker) — a returned promise never blocks the envelope
+    const invokeAfterTurn = (ok: boolean, answer: string): void => {
+      let tail: void | Promise<void>;
+      try { tail = deps.afterTurn?.(id, { ok, turnId: durableTurnId, answer }); } catch { return; /* host hook best-effort */ }
+      if (tail instanceof Promise) {
+        if (exec) void exec.trackWorker({ turnId: durableTurnId, identity: { seam: 'afterTurn' } }, 'afterTurn', () => tail);
+        else void tail.catch(() => undefined);
+      }
+    };
     // #7: client disconnect mid-flight aborts the turn. The seam is the
     // RESPONSE stream: req.raw 'close' fires when the request body completes
     // (not socket death); reply.raw 'close' with !writableEnded = the client
@@ -295,7 +309,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         try {
           const stored = await storage.noteEmbeddings(deps.embedder.model);
           if (stored.length) {
-            const qv = (await deps.embedder.embed([b.content]))[0]!;
+            const qv = (await deps.embedder.embed([content]))[0]!;
             const byId = new Map(notes.map((n) => [n.id, n]));
             const ranked = stored
               .map((se) => ({ note: byId.get(se.noteId), score: cosine(qv, Array.from(se.vector)) }))
@@ -350,43 +364,83 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           resumeNote = '\n\n[resume] The previous turn on this session ran out of runway mid-task. Its full transcript, including tool results, is prepended to the history below. Continue that work from where it stopped — do not repeat completed steps.';
         }
       }
-      const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, b.content, {
-        sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
-        // prior turns only — the current message rides as userMessage; a
-        // stashed partial (if any) rides FIRST: it is the most recent context
-        history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
-        provider: turnProvider,
-        tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
-        ...(deps.budget ? { budget: deps.budget } : {}),
-        signal: ac.signal,
-        // rev10: live token stream → transport events (WS bridge streams UI)
-        ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
-        onMessage: (msg, meta) => {
-          if (!sink) void storage.appendMessage({
-            session_id: id, role: msg.role, content: msg.content,
-            tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
-            tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
-          });
-        },
-        onTool: (t) => {
-          // R3 fix: tool calls are durable entities too — the rail correlates by
-          // toolCallId, and the replay log must show HOW an answer was derived.
-          if (!sink && !exec) return;
-          const stable = `tc_${durableTurnId}_${t.name}`;
-          if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
-          else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
-        },
-        onEvent: (e) => {
-          deps.emit({ ...e, sessionId: id });
-          if (sink || exec) {
-            if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
-            if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
-              const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
-              if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
-            }
-          }
-        },
-      });
+      const result = await (exec && ownedAttempt
+        ? exec.trackWorker({ turnId: durableTurnId, identity: { seam: 'provider' } }, 'provider', () => runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, content, {
+            sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
+            // prior turns only — the current message rides as userMessage; a
+            // stashed partial (if any) rides FIRST: it is the most recent context
+            history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
+            provider: turnProvider,
+            tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
+            ...(deps.budget ? { budget: deps.budget } : {}),
+            signal: ac.signal,
+            // rev10: live token stream → transport events (WS bridge streams UI)
+            ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
+            onMessage: (msg, meta) => {
+              if (!sink) void storage.appendMessage({
+                session_id: id, role: msg.role, content: msg.content,
+                tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
+                tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
+              });
+            },
+            onTool: (t) => {
+              // R3 fix: tool calls are durable entities too — the rail correlates by
+              // toolCallId, and the replay log must show HOW an answer was derived.
+              // chat-reliability F1: identity is per INVOCATION (provider-native
+              // call id) — repeated same-name invocations are distinct durable
+              // calls; the name-derived id remains only for legacy harness events
+              // that carry no native id.
+              if (!sink && !exec) return;
+              const stable = t.invocationId !== undefined ? `tc_${durableTurnId}_i_${t.invocationId}` : `tc_${durableTurnId}_${t.name}`;
+              if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
+              else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
+            },
+            onEvent: (e) => {
+              deps.emit({ ...e, sessionId: id });
+              if (sink || exec) {
+                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+                if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
+                  const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
+                  if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
+                }
+              }
+            },
+          })) as unknown as Awaited<ReturnType<typeof runLoop>>
+        : runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, content, {
+            sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
+            // prior turns only — the current message rides as userMessage; a
+            // stashed partial (if any) rides FIRST: it is the most recent context
+            history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
+            provider: turnProvider,
+            tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
+            ...(deps.budget ? { budget: deps.budget } : {}),
+            signal: ac.signal,
+            // rev10: live token stream → transport events (WS bridge streams UI)
+            ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
+            onMessage: (msg, meta) => {
+              if (!sink) void storage.appendMessage({
+                session_id: id, role: msg.role, content: msg.content,
+                tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
+                tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
+              });
+            },
+            onTool: (t) => {
+              if (!sink && !exec) return;
+              const stable = t.invocationId !== undefined ? `tc_${durableTurnId}_i_${t.invocationId}` : `tc_${durableTurnId}_${t.name}`;
+              if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
+              else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
+            },
+            onEvent: (e) => {
+              deps.emit({ ...e, sessionId: id });
+              if (sink || exec) {
+                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+                if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
+                  const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
+                  if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
+                }
+              }
+            },
+          }));
       // v0.5.4: an EMPTY answer after real work is not success. A turn that
       // streamed narration or called tools and still ends with "" burned its
       // context (the 05:46 incident: 1M tokens, 40 tool calls, answer "") —
@@ -396,21 +450,47 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       const turnEvents = sink ? sink.events(id) : [];
       const didWork = turnEvents.some((e) => e.turn_id === durableTurnId && (e.kind === 'chunk' || e.kind === 'tool_call' || e.kind === 'tool_call_update'));
       if (!result.answer.trim() && didWork) {
-        durable({ kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: 'turn ended with an empty answer after processing (likely context exhaustion mid-run) — partial transcript preserved in the event log; resend to continue' } as TurnCommand, `chat:${durableTurnId}:emptyfail`);
         outcome.ok = false;
         outcome.error = 'empty answer after work — turn failed honestly (see event log)';
-        await storage.updateSession(id, { status: 'error' });
-        await releaseOwnership('EMPTY_AFTER_WORK');
+        if (exec && ownedAttempt) {
+          await exec.finalizeOwned(ownedAttempt, {
+            kind: 'turn.fail',
+            error: 'turn ended with an empty answer after processing (likely context exhaustion mid-run) — partial transcript preserved in the event log; resend to continue',
+            commandKey: `chat:${durableTurnId}:emptyfail`,
+            settleCode: 'EMPTY_AFTER_WORK',
+            accounting: { status: 'error' },
+          });
+          ownsLiveTurn = false;
+        } else {
+          durable({ kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: 'turn ended with an empty answer after processing (likely context exhaustion mid-run) — partial transcript preserved in the event log; resend to continue' } as TurnCommand, `chat:${durableTurnId}:emptyfail`);
+          await storage.updateSession(id, { status: 'error' });
+          await releaseOwnership('EMPTY_AFTER_WORK');
+        }
         return { turn: outcome };
       }
-      durable({ kind: 'turn.complete', sessionId: id, turnId: durableTurnId, answer: result.answer } as TurnCommand, `chat:${durableTurnId}:done`);
       outcome.ok = true;
       outcome.answer = result.answer;
       outcome.tokens = result.tokens;
       outcome.hops = result.hops;
-      await storage.updateSession(id, { status: 'active', tokens_in: session.tokens_in + result.tokens.in, tokens_out: session.tokens_out + result.tokens.out });
-      await releaseOwnership('COMPLETED');
-      try { deps.afterTurn?.(id, { ok: true, turnId: durableTurnId, answer: result.answer }); } catch { /* host hook best-effort */ }
+      if (exec && ownedAttempt) {
+        // §3.5 owned ATOMIC finalization: terminal event + projections + token
+        // accounting + ledger settle commit together; the envelope reports
+        // success only for a committed terminal.
+        const fin = await exec.finalizeOwned(ownedAttempt, {
+          kind: 'turn.complete',
+          answer: result.answer,
+          commandKey: `chat:${durableTurnId}:done`,
+          settleCode: 'COMPLETED',
+          accounting: { status: 'active', tokensInDelta: result.tokens.in, tokensOutDelta: result.tokens.out },
+        });
+        ownsLiveTurn = false;
+        if (!fin.accounted) await storage.updateSession(id, { status: 'active', tokens_in: session.tokens_in + result.tokens.in, tokens_out: session.tokens_out + result.tokens.out });
+      } else {
+        durable({ kind: 'turn.complete', sessionId: id, turnId: durableTurnId, answer: result.answer } as TurnCommand, `chat:${durableTurnId}:done`);
+        await storage.updateSession(id, { status: 'active', tokens_in: session.tokens_in + result.tokens.in, tokens_out: session.tokens_out + result.tokens.out });
+        await releaseOwnership('COMPLETED');
+      }
+      invokeAfterTurn(true, result.answer);
       return { turn: outcome };
     } catch (err) {
       const e = err as { code?: string; message?: string };
@@ -421,16 +501,39 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       // provider, unknown) keeps today's honest session-poisoning.
       const budgetExhausted = err instanceof LoopError && err.code === 'BUDGET_EXCEEDED';
       if (budgetExhausted) {
-        try { await storage.stashPartial(id, durableTurnId, JSON.stringify(err.partial ?? [])); } catch { /* stash is best-effort */ }
+        // AUTHORITY path: the budget stash joins the atomic finalization
+        // transaction below (finalizeOwned), never a separate best-effort write
+        if (!exec) { try { await storage.stashPartial(id, durableTurnId, JSON.stringify(err.partial ?? [])); } catch { /* stash is best-effort */ } }
         outcome.error = 'ran out of runway — the work so far is kept; send a message to continue from where it stopped';
       } else {
         outcome.error = e.message ?? String(err);
       }
-      if (deps.sink || exec) durable({ kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error } as TurnCommand, `chat:${durableTurnId}:fail`);
       outcome.code = e.code ?? undefined;
-      await storage.updateSession(id, { status: budgetExhausted ? 'active' : 'error' });
-      await releaseOwnership(budgetExhausted ? 'BUDGET_EXCEEDED' : (e.code ?? 'FAILED'));
-      try { deps.afterTurn?.(id, { ok: false, turnId: durableTurnId, answer: '' }); } catch { /* host hook best-effort */ }
+      if (exec && ownedAttempt) {
+        // §3.5 owned ATOMIC finalization: terminal event + budget stash +
+        // session accounting + ledger settle in ONE commit. A storage failure
+        // leaves the attempt reserved for an idempotent retry and reports
+        // outcome-pending — never a false success.
+        try {
+          const fin = await exec.finalizeOwned(ownedAttempt, {
+            kind: 'turn.fail',
+            error: outcome.error,
+            commandKey: `chat:${durableTurnId}:fail`,
+            settleCode: budgetExhausted ? 'BUDGET_EXCEEDED' : (e.code ?? 'FAILED'),
+            ...(budgetExhausted && err instanceof LoopError ? { stash: { json: JSON.stringify(err.partial ?? []) } } : {}),
+            accounting: { status: budgetExhausted ? 'active' : 'error' },
+          });
+          ownsLiveTurn = false;
+          if (!fin.accounted) await storage.updateSession(id, { status: budgetExhausted ? 'active' : 'error' });
+        } catch (finErr) {
+          return reply.code(503).send({ error: `finalization storage failure — outcome pending, the turn stays reserved for idempotent retry: ${finErr instanceof Error ? finErr.message : String(finErr)}`, code: 'FINALIZATION_PENDING' });
+        }
+      } else {
+        if (deps.sink || exec) durable({ kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error } as TurnCommand, `chat:${durableTurnId}:fail`);
+        await storage.updateSession(id, { status: budgetExhausted ? 'active' : 'error' });
+        await releaseOwnership(budgetExhausted ? 'BUDGET_EXCEEDED' : (e.code ?? 'FAILED'));
+      }
+      invokeAfterTurn(false, '');
       return { turn: outcome }; // the turn failed; the REQUEST succeeded — outcome carries the verdict
     }
   });
