@@ -4,7 +4,7 @@
  *  rows alone (condition 4). */
 import type { FastifyInstance } from 'fastify';
 import type { Storage } from '../memory/contract.ts';
-import { runLoop } from '../loop.ts';
+import { runLoop, LoopError } from '../loop.ts';
 import type { EventSink } from '../orchestrate/event-sink.ts';
 import type { Provider, ProviderMessage, ProviderResponse, ProviderTool } from '../provider/index.ts';
 import type { Policy, ToolRegistry } from '../tools.ts';
@@ -172,6 +172,20 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content ?? '' }));
 
+    // no-hassle resume (2026-10-21 plan): if the previous turn died on the
+    // budget guard, its transcript (tool results included) was stashed —
+    // seed it back so the model CONTINUES instead of redoing (and re-dying
+    // on) the same hops. One-shot: takePartial consumes the stash.
+    let resumeNote = '';
+    let seeded: ProviderMessage[] = [];
+    try {
+      const stash = await storage.takePartial(id);
+      if (stash) {
+        seeded = JSON.parse(stash.json) as ProviderMessage[];
+        resumeNote = '\n\n[resume] The previous turn on this session ran out of runway mid-task. Its full transcript, including tool results, is prepended to the history below. Continue that work from where it stopped — do not repeat completed steps.';
+      }
+    } catch { /* a corrupt stash must never kill the next turn */ }
+
     const outcome: TurnOutcome = { sessionId: id, ok: false, tokens: { in: 0, out: 0 }, hops: 0 };
     const ac = new AbortController();
     activeTurns.set(id, ac);
@@ -232,9 +246,11 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       try { prep = await deps.prepareTurn?.(id, b as { content: string; commands?: string[] }) ?? null; }
       catch { prep = null; } // decoration failure must never kill the turn
       const turnProvider = prep?.provider ?? (routedComplete ? { complete: (m, t, o) => routedComplete(m, t, o), model: routedModel ?? deps.provider.model } : deps.provider);
-      const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? ''), b.content, {
+      const result = await runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, b.content, {
         sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
-        history: history.length > 1 ? history.slice(-40, -1) : [], // prior turns only — the current message rides as userMessage
+        // prior turns only — the current message rides as userMessage; a
+        // stashed partial (if any) rides FIRST: it is the most recent context
+        history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
         provider: turnProvider,
         tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
         ...(deps.budget ? { budget: deps.budget } : {}),
@@ -294,10 +310,21 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       return { turn: outcome };
     } catch (err) {
       const e = err as { code?: string; message?: string };
-      outcome.error = e.message ?? String(err);
+      // no-hassle resume (2026-10-21 plan): budget exhaustion is a PAUSE, not
+      // a session death. Stash the partial transcript (LoopError carries the
+      // full loop messages — tool results included), keep the session usable,
+      // and tell the operator how to continue. Every other failure (ABORTED,
+      // provider, unknown) keeps today's honest session-poisoning.
+      const budgetExhausted = err instanceof LoopError && err.code === 'BUDGET_EXCEEDED';
+      if (budgetExhausted) {
+        try { await storage.stashPartial(id, durableTurnId, JSON.stringify(err.partial ?? [])); } catch { /* stash is best-effort */ }
+        outcome.error = 'ran out of runway — the work so far is kept; send a message to continue from where it stopped';
+      } else {
+        outcome.error = e.message ?? String(err);
+      }
       if (deps.sink) deps.sink.handle(id, { kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error }, `chat:${durableTurnId}:fail`);
       outcome.code = e.code ?? undefined;
-      await storage.updateSession(id, { status: 'error' });
+      await storage.updateSession(id, { status: budgetExhausted ? 'active' : 'error' });
       activeTurns.delete(id);
       try { deps.afterTurn?.(id, { ok: false, turnId: durableTurnId, answer: '' }); } catch { /* host hook best-effort */ }
       return { turn: outcome }; // the turn failed; the REQUEST succeeded — outcome carries the verdict

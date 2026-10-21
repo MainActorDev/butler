@@ -99,6 +99,13 @@ CREATE TABLE IF NOT EXISTS butler_artifacts(
 );
 CREATE INDEX IF NOT EXISTS butler_artifacts_kind_name ON butler_artifacts(kind, name);
 CREATE INDEX IF NOT EXISTS butler_artifacts_run ON butler_artifacts(run_id);
+
+CREATE TABLE IF NOT EXISTS butler_turn_partials(
+  session_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
 `;
 
 export class PostgresStorage implements Storage {
@@ -188,6 +195,19 @@ export class PostgresStorage implements Storage {
       [id, m.session_id, m.role, m.content, m.tool_calls_json, m.tool_results_json, m.tokens_in, m.tokens_out, created],
     );
     return { ...m, id, created_at: created };
+  }
+
+  async stashPartial(sessionId: string, turnId: string, json: string): Promise<void> {
+    await this.pool.query(
+      'INSERT INTO butler_turn_partials(session_id, turn_id, json, created_at) VALUES ($1,$2,$3,$4) ON CONFLICT (session_id) DO UPDATE SET turn_id = $2, json = $3, created_at = $4',
+      [sessionId, turnId, json, Date.now()],
+    );
+  }
+
+  async takePartial(sessionId: string): Promise<{ turnId: string; json: string } | null> {
+    const r = await this.pool.query('DELETE FROM butler_turn_partials WHERE session_id = $1 RETURNING turn_id, json', [sessionId]);
+    const row = r.rows[0] as { turn_id: string; json: string } | undefined;
+    return row ? { turnId: String(row.turn_id), json: String(row.json) } : null;
   }
 
   async sessionMessages(sessionId: string): Promise<MessageRow[]> {

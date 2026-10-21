@@ -110,6 +110,13 @@ export interface Storage {
   appendMessage(m: Omit<MessageRow, 'id' | 'created_at'>): Promise<MessageRow>;
   sessionMessages(sessionId: string): Promise<MessageRow[]>;
 
+  // partial-turn stash (no-hassle resume, 2026-10-21 plan): a budget-exhausted
+  // chat turn parks its transcript (tool results included, opaque JSON) here;
+  // the NEXT message in the same session takes it — one-shot, consumed on
+  // read — to seed the loop so the model continues instead of redoing hops.
+  stashPartial(sessionId: string, turnId: string, json: string): Promise<void>;
+  takePartial(sessionId: string): Promise<{ turnId: string; json: string } | null>;
+
   // notes (explicit-write only; supersession, never delete)
   insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at' | 'superseded_reason'>): Promise<NoteRow>;
   activeNotes(scopeKeyPrefix?: string): Promise<NoteRow[]>;
