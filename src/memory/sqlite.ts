@@ -102,6 +102,13 @@ CREATE TABLE IF NOT EXISTS butler_artifacts(
 );
 CREATE INDEX IF NOT EXISTS butler_artifacts_kind_name ON butler_artifacts(kind, name);
 CREATE INDEX IF NOT EXISTS butler_artifacts_run ON butler_artifacts(run_id);
+
+CREATE TABLE IF NOT EXISTS butler_turn_partials(
+  session_id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
 
 export class SqliteStorage implements Storage {
@@ -169,6 +176,17 @@ export class SqliteStorage implements Storage {
     this.db.prepare('INSERT INTO butler_messages(id, session_id, role, content, tool_calls_json, tool_results_json, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
       .run(id, m.session_id, m.role, m.content, m.tool_calls_json, m.tool_results_json, m.tokens_in, m.tokens_out, created);
     return { ...m, id, created_at: created };
+  }
+
+  async stashPartial(sessionId: string, turnId: string, json: string): Promise<void> {
+    this.db.prepare('INSERT OR REPLACE INTO butler_turn_partials(session_id, turn_id, json, created_at) VALUES (?,?,?,?)').run(sessionId, turnId, json, Date.now());
+  }
+
+  async takePartial(sessionId: string): Promise<{ turnId: string; json: string } | null> {
+    const row = this.db.prepare('SELECT turn_id, json FROM butler_turn_partials WHERE session_id = ?').get(sessionId) as { turn_id: string; json: string } | undefined;
+    if (!row) return null;
+    this.db.prepare('DELETE FROM butler_turn_partials WHERE session_id = ?').run(sessionId);
+    return { turnId: row.turn_id, json: row.json };
   }
 
   async sessionMessages(sessionId: string): Promise<MessageRow[]> {
