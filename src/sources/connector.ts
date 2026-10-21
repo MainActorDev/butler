@@ -4,7 +4,7 @@
  *  unchanged content skips re-chunking. Caps per D12. */
 import { createHash } from 'node:crypto';
 import type { Storage, DocumentRow, ChunkRow } from '../memory/contract.ts';
-import { structuralChunks } from '../chunk.ts';
+import { structuralChunks, type StructuralChunk } from '../chunk.ts';
 
 export interface NormalizedDocument {
   uri: string;
@@ -14,6 +14,11 @@ export interface NormalizedDocument {
   kind: string;
   /** binary bytes when content is null → stored at bytes_path */
   bytes?: Uint8Array;
+  /** PRE-CHUNKED content (Stage-3 F1 passthrough): when present, ingest
+   *  stores these chunks verbatim instead of re-chunking `content`. Lets a
+   *  connector emit structured chunks (e.g. per-symbol heading_path) while
+   *  `content` stays a browsable summary. Ordinals as given, 0-based. */
+  chunks?: StructuralChunk[];
 }
 
 export interface SourceConnector {
@@ -86,7 +91,7 @@ export async function ingest(
 
     let chunks: Array<Omit<ChunkRow, 'id' | 'doc_sha256'>> = [];
     if (isText) {
-      chunks = structuralChunks(doc.content!, doc.kind).map((c) => ({ ordinal: c.ordinal, heading_path: c.headingPath, content: c.content, tokens: c.tokens }));
+      chunks = (doc.chunks ?? structuralChunks(doc.content!, doc.kind)).map((c) => ({ ordinal: c.ordinal, heading_path: c.headingPath, content: c.content, tokens: c.tokens }));
       if (totalChunks + chunks.length > MAX_CHUNKS_PER_SOURCE) {
         chunks = chunks.slice(0, Math.max(0, MAX_CHUNKS_PER_SOURCE - totalChunks));
         if (chunks.length === 0) { out.skipped.push({ uri: doc.uri, reason: 'chunk cap reached for source' }); continue; }

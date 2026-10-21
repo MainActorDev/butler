@@ -48,6 +48,32 @@ export class EsCompatRetriever implements Retriever {
     return (body.hits?.hits ?? []).map((h) => this.map(h));
   }
 
+  /** Structured search (Stage-3 F2): BM25 over `query` with an optional
+   *  heading_path prefix filter. The mapping's heading_path is text+keyword;
+   *  match_phrase_prefix matches the ANALYZED field, so a prefix like
+   *  "symbol: CliError" hits "symbol: CliError (class)" exactly without
+   *  wildcard cost. Same failure contract as retrieve(): throws. */
+  async search(opts: { query: string; headingPrefix?: string; size?: number }): Promise<RetrievedChunk[]> {
+    const must = opts.query.length > 0 ? [{ match: { [this.field]: opts.query } }] : [{ match_all: {} }];
+    const filter = opts.headingPrefix ? [{ bool: { should: [
+      { match_phrase_prefix: { heading_path: opts.headingPrefix } },
+      { match_phrase: { heading_path: opts.headingPrefix } },
+    ] } }] : [];
+    const res = await this.fetchImpl(`${this.baseUrl}/${this.index}/_search`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        size: opts.size ?? 10,
+        query: { bool: { must, filter } },
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`es-compat structured search failed (${res.status}): ${(await res.text().catch(() => '')).slice(0, 200)}`);
+    }
+    const body = (await res.json()) as { hits?: { hits?: EsHit[] } };
+    return (body.hits?.hits ?? []).map((h) => this.map(h));
+  }
+
   private map(h: EsHit): RetrievedChunk {
     const src = h._source ?? {};
     if (h._id.startsWith('note:')) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractSymbols, symbolChunks } from '../src/sources/tree-sitter.ts';
+import { extractSymbols, symbolChunksFor } from '../src/sources/tree-sitter.ts';
 import { repoConnector } from '../src/sources/repo.ts';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -52,13 +52,13 @@ describe('extractSymbols (TS-family structural scan)', () => {
     expect(extractSymbols('def f(): pass', 'script.py')).toEqual([]);
     expect(extractChunksPlain()).toBe(true);
     function extractChunksPlain(): boolean {
-      const chunks = symbolChunks('def f(): pass', 'script.py');
+      const chunks = symbolChunksFor(extractSymbols('def f(): pass', 'script.py'), 'def f(): pass', 'script.py');
       return chunks.length === 0;
     }
   });
 
   it('symbolChunks carry heading_path + file:line + context', () => {
-    const chunks = symbolChunks(SAMPLE, 'src/sample.ts');
+    const chunks = symbolChunksFor(extractSymbols(SAMPLE, 'src/sample.ts'), SAMPLE, 'src/sample.ts');
     const rl = chunks.find((c) => c.headingPath === 'symbol: runLoop (function)')!;
     expect(rl.content).toContain('src/sample.ts:');
     expect(rl.content).toContain('export async function runLoop');
@@ -80,6 +80,8 @@ describe('repo connector symbols opt-in', () => {
     expect(symDoc).toBeTruthy();
     expect(symDoc!.content).toContain('symbol: alpha (function)');
     expect(symDoc!.content).toContain('symbol: beta (function)');
+    // Stage-3 shape: per-symbol chunks with structured heading_path (F1)
+    expect(symDoc!.chunks?.map((c) => c.headingPath)).toContain('symbol: beta (function)');
     rmSync(dir, { recursive: true, force: true });
   });
 });

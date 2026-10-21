@@ -30,7 +30,7 @@ export type { SourceConnector, NormalizedDocument, IngestResult } from './source
 export { fileConnector } from './sources/file.ts';
 export { jiraConnector, githubConnector } from './sources/jira-github.ts';
 export type { JiraSourceConfig, GithubSourceConfig } from './sources/jira-github.ts';
-export { repoConnector } from './sources/repo.ts';
+export { repoConnector, repoDocumentFor, symbolDocFor } from './sources/repo.ts';
 export type { RepoSourceConfig } from './sources/repo.ts';
 
 // Stage 4 — transports (conversation API + MCP; consumers mount these)
@@ -39,9 +39,14 @@ export type { ConversationDeps, TurnOutcome } from './transport/conversation.ts'
 export { mountMcp } from './transport/mcp.ts';
 export type { McpMountOpts } from './transport/mcp.ts';
 
-// Roadmap stage G — symbol chunks (repo sources opt-in)
-export { extractSymbols, symbolChunks } from './sources/tree-sitter.ts';
-export type { SymbolInfo, SymbolChunk } from './sources/tree-sitter.ts';
+// Roadmap stage G → Stage-3 v2 — symbol chunks (tree-sitter WASM; repo
+// sources opt in with a grammar map, regex fallback without)
+export { extractSymbols, extractSymbolsTree, symbolsFor, symbolChunksFor, prepareGrammars, defaultSymbolGrammars } from './sources/tree-sitter.ts';
+export type { SymbolInfo, SymbolChunk, SymbolGrammars } from './sources/tree-sitter.ts';
+
+// Stage 3 — watchRoots mechanism (freshness; policy lives with the consumer)
+export { watchRoots } from './watch.ts';
+export type { WatchHandle, WatchOptions } from './watch.ts';
 
 // Roadmap stage F — postgres storage driver
 export { PostgresStorage } from './memory/postgres.ts';

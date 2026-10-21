@@ -1,8 +1,8 @@
 {
   "name": "@mainactordev/butler",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
-  "description": "Butler \u2014 reusable agent runtime: provider, loop, tool registry, layered memory, source ingestion, conversation API + MCP transports (plan 20261001T035356Z)",
+  "description": "Butler — reusable agent runtime: provider, loop, tool registry, layered memory, source ingestion, conversation API + MCP transports (plan 20261001T035356Z)",
   "type": "module",
   "main": "src/index.ts",
   "exports": {
@@ -18,9 +18,11 @@
     "@fastify/websocket": "^11.3.1",
     "@modelcontextprotocol/fastify": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.31.0",
+    "better-sqlite3": "^13.0.3",
     "pg": "^8.23.0",
-    "zod": "^4.6.5",
-    "better-sqlite3": "^13.0.3"
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.25.4",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

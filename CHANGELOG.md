@@ -1,3 +1,33 @@
+## [0.8.0] — 2026-10-21 (Stage 3: tree-sitter symbols + watchRoots + structured search)
+
+### Added
+- **tree-sitter WASM symbol extraction** — `extractSymbolsTree`/`symbolsFor` parse Swift /
+  TypeScript / TSX / JS / Python via `web-tree-sitter` (0.25.4) + the `tree-sitter-wasms` pack.
+  Grammar policy is CALLER-supplied (`SymbolGrammars`: ext → pack name or absolute .wasm path);
+  `defaultSymbolGrammars()` ships butler's preset. No grammar configured → v1 TS/JS regex
+  fallback; grammar load failure → empty result, never fatal.
+  **Vendored `grammars/tree-sitter-swift.wasm`** (from tree-sitter-wasms@0.1.8): the pack's
+  swift build ≥ 0.1.10 aborts Node ≥ 24 (`Fatal process out of memory: Zone`, V8 turboshaft
+  wasm tier-up — background thread, process-fatal; `--liftoff-only` avoids it but is banned in
+  NODE_OPTIONS). See grammars/README.md; re-extract when upstream fixes it.
+- **Per-symbol chunks (F1)** — `NormalizedDocument.chunks?` passthrough: ingest stores
+  pre-chunked docs verbatim. `repoConnector(symbols: true)` now emits one chunk per symbol with
+  `heading_path "symbol: <name> (<kind>)"` (v1 concatenated all symbols into doc content,
+  unretrievable by heading). Doc content stays a browsable summary.
+- **`repoDocumentFor(cfg, absPath)`** (F3) — per-file normalize (file doc + symbol doc) honoring
+  the same skip rules; the freshness watcher path re-ingests one changed file without paying the
+  walk. `symbolDocFor` exported alongside.
+- **`watchRoots(roots, opts, onBatch)`** — debounced changed-path batches, one OS watch per root
+  (no polling), caller-supplied ignore policy, `healthy()`/`describe()` surface; watcher errors
+  mark the root dead, never throw into the caller's loop.
+- **`EsCompatRetriever.search({ query, headingPrefix?, size })`** (F2) — structured search:
+  BM25 + optional heading_path prefix filter (match_phrase_prefix over the analyzed field).
+  Same throw contract as `retrieve()`.
+- Hermetic tests: WASM extraction per language, per-file normalize, chunks passthrough +
+  idempotence, watcher batches/ignore/health (real fs events, tmp dirs), structured search
+  (fake endpoint). Full suite 226 passed; `node:module` + `web-tree-sitter` added to the
+  boundary allowlist.
+
 ## [0.7.0] — 2026-10-21 (Stage 2b: ES-compatible retrieval + xerj sidecar runner)
 
 ### Added
