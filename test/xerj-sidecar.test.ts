@@ -12,7 +12,7 @@ function fakeEs(): { fetchImpl: typeof fetch; store: Map<string, EsCorpusDoc>; c
   const calls: string[] = [];
   const state = { bulkDocs: 0 };
   const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = String(input);
     const method = init?.method ?? 'GET';
     calls.push(`${method} ${url.replace('http://127.0.0.1:9200', '')}`);

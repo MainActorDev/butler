@@ -46,6 +46,9 @@ export interface XerjSidecarResult {
   stop(): void;
 }
 
+/** minimal child-process shape (structural over spawn's ChildProcess) */
+interface SidecarChild { pid: number | undefined; kill(): void }
+
 const INSTALL_HINT = 'xerj is not on PATH. Install it explicitly (one-time, per machine):\n  curl -fsSL https://xerj.org/get | sh';
 
 export async function xerjSidecar(opts: XerjSidecarOpts): Promise<XerjSidecarResult> {
@@ -63,11 +66,11 @@ export async function xerjSidecar(opts: XerjSidecarOpts): Promise<XerjSidecarRes
     return { retriever: null, degraded: `no healthy sidecar at ${baseUrl} (attachOnly)`, indexedCount: null, stop: noopStop };
   }
   const binary = opts.binaryPath ?? 'xerj';
-  let child: { pid?: number; killed: boolean; kill(): void } | null = null;
+  let child: SidecarChild | null = null;
   try {
     child = opts.spawnImpl
-      ? opts.spawnImpl(binary, sidecarArgs(opts.dataDir))
-      : spawn(binary, sidecarArgs(opts.dataDir), { stdio: 'ignore', detached: false });
+      ? (opts.spawnImpl(binary, sidecarArgs(opts.dataDir)) as SidecarChild)
+      : (spawn(binary, sidecarArgs(opts.dataDir), { stdio: 'ignore', detached: false }) as unknown as SidecarChild);
   } catch (err) {
     return { retriever: null, degraded: `failed to start sidecar: ${(err as Error).message}\n${INSTALL_HINT}`, indexedCount: null, stop: noopStop };
   }
@@ -77,7 +80,7 @@ export async function xerjSidecar(opts: XerjSidecarOpts): Promise<XerjSidecarRes
     if (await healthy(fetchImpl, baseUrl)) return finish(await reconcile(opts, index, log, fetchImpl));
     await sleep(500);
   }
-  child.kill();
+  child?.kill();
   return {
     retriever: null,
     degraded: `sidecar did not become healthy at ${baseUrl} within ${opts.startupTimeoutMs ?? 30_000}ms\n${INSTALL_HINT}`,
@@ -85,7 +88,7 @@ export async function xerjSidecar(opts: XerjSidecarOpts): Promise<XerjSidecarRes
     stop: noopStop,
   };
 
-  function finish(r: XerjSidecarResult): XerjSidecarResult {
+  function finish(r: Omit<XerjSidecarResult, 'stop'>): XerjSidecarResult {
     return { ...r, stop: () => child?.kill() };
   }
 }
@@ -109,7 +112,7 @@ async function healthy(fetchImpl: typeof fetch, baseUrl: string): Promise<boolea
  *  live corpus and an 85-minute neural ingest. Count assertion aborts the
  *  TOP-UP only — serving continues on the shorter index (degraded note rides
  *  the consumer's staleNote channel). */
-async function reconcile(opts: XerjSidecarOpts, index: string, log: (s: string) => void, fetchImpl: typeof fetch): Promise<{ retriever: EsCompatRetriever; degraded: string | null; indexedCount: number | null }> {
+async function reconcile(opts: XerjSidecarOpts, index: string, log: (s: string) => void, fetchImpl: typeof fetch): Promise<Omit<XerjSidecarResult, 'stop'>> {
   const baseUrl = (opts.baseUrl ?? 'http://127.0.0.1:9200').replace(/\/$/, '');
   const retriever = new EsCompatRetriever({ baseUrl, index, fetchImpl });
   // ensure index exists (idempotent)
