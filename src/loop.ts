@@ -200,13 +200,21 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
         throw new LoopError(`tool ${call.function.name} sent invalid JSON twice`, 'TOOL_CALL_INVALID', messages, 'tool-invalid');
       }
       deps.onEvent?.({ type: 'turn.tool', hop, detail: { phase: 'call', name: call.function.name } });
+      // chat-reliability F1 (tool durability): ordinary registry tools must
+      // ride the SAME durable seam as streamed harness tools — the loop emits
+      // per-invocation call/result callbacks so the transport's durable path
+      // records them (previously runtime tools produced ZERO durable events).
+      deps.onTool?.({ phase: 'call', name: call.function.name, arg: call.function.arguments });
       let obs: string;
+      let toolFailed = false;
       try {
         obs = await tool.execute(args, { signal: deps.signal ?? undefined });
       } catch (err) {
         // handler throws become observations (ReAct) — the loop continues
         obs = `error: ${err instanceof Error ? err.message : String(err)}`;
+        toolFailed = true;
       }
+      deps.onTool?.({ phase: 'result', name: call.function.name, result: obs, isError: toolFailed });
       const msg: ProviderMessage = { role: 'tool', content: obs, tool_call_id: call.id };
       messages.push(msg);
       deps.onMessage?.(msg, { hop, tokensIn: 0, tokensOut: 0 });
