@@ -147,11 +147,22 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     const session = await storage.getSession(id);
     if (!session) return reply.code(404).send({ error: 'session not found' });
     if (activeTurns.has(id)) return reply.code(409).send({ error: 'turn already in flight on this session' });
-
+    // F1 (chat-reliability): check-and-acquire is atomic — no await between
+    // has() and set() — and the reservation precedes every durable write,
+    // history/stash preparation and host hook. Every exit path below releases
+    // it; the admission race loser gets 409 BEFORE any side effect.
+    const ac = new AbortController();
+    activeTurns.set(id, ac);
+    // These survive the preparation window — declared OUTSIDE the prep try so
+    // the execution section can read them (block scoping).
+    const durableTurnId = `t_${crypto.randomUUID().slice(0, 12)}`;
+    let resumeNote = '';
+    let seeded: ProviderMessage[] = [];
+    let history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+    try {
     // R3-S5 single-writer rule: user message rides the durable log when a sink
     // is wired; the projection writes butler_messages. Legacy path (no sink)
     // keeps the direct append so existing hosts don't break.
-    const durableTurnId = `t_${crypto.randomUUID().slice(0, 12)}`;
     if (deps.sink) {
       // R3 queue-drain: a followUp message queued against an earlier (now-dead)
       // turn starts ITS OWN turn — the queue must never strand content silently.
@@ -168,7 +179,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     }
 
     // resume context from rows alone (condition 4)
-    const history = (await storage.sessionMessages(id))
+    history = (await storage.sessionMessages(id))
       .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content ?? '' }));
 
@@ -176,8 +187,6 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     // budget guard, its transcript (tool results included) was stashed —
     // seed it back so the model CONTINUES instead of redoing (and re-dying
     // on) the same hops. One-shot: takePartial consumes the stash.
-    let resumeNote = '';
-    let seeded: ProviderMessage[] = [];
     try {
       const stash = await storage.takePartial(id);
       if (stash) {
@@ -186,9 +195,13 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       }
     } catch { /* a corrupt stash must never kill the next turn */ }
 
+    } catch (prepErr) {
+      // F1: a preparation failure (durable write, history read, stash parse)
+      // must never strand the session reservation.
+      activeTurns.delete(id);
+      return reply.code(500).send({ error: `turn preparation failed: ${prepErr instanceof Error ? prepErr.message : String(prepErr)}` });
+    }
     const outcome: TurnOutcome = { sessionId: id, ok: false, tokens: { in: 0, out: 0 }, hops: 0 };
-    const ac = new AbortController();
-    activeTurns.set(id, ac);
     // #7: client disconnect mid-flight aborts the turn. The seam is the
     // RESPONSE stream: req.raw 'close' fires when the request body completes
     // (not socket death); reply.raw 'close' with !writableEnded = the client
