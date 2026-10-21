@@ -1,3 +1,20 @@
+## [0.7.0] — 2026-10-21 (Stage 2b: ES-compatible retrieval + xerj sidecar runner)
+
+### Added
+- `EsCompatRetriever` — a `Retriever` over any Elasticsearch-compatible HTTP endpoint (xerj in
+  practice). BM25-only by design (Lionidas Stage-1 evidence: parity with in-memory BM25 at ~400×
+  lower latency; hybrid/semantic added nothing on the eval corpus). Hit ids carry provenance:
+  `<docSha256>#<ordinal>` (chunks) / `note:<id>` (notes). Failures throw — degradation is the
+  runner's decision.
+- `xerjSidecar()` — optional one-call runner: locate/spawn the sidecar (loopback, pinned flags),
+  health-wait, then a resumable reconcile (mget existence checks + bulk with retries) from a
+  consumer-supplied corpus enumerator (butler has no list-all seam). Returns
+  `{ retriever, degraded, indexedCount, stop }`; every failure is a degraded result with the
+  explicit install hint — never a throw, never a silent install, nothing spawns at import.
+- `chunkToEsDoc` / `noteToEsDoc` helpers mapping butler row shapes to index docs.
+- Hermetic tests over a fake ES endpoint (injectable fetch + spawn): provenance mapping, throw
+  contract, attach/reconcile/idempotent-skip/degraded paths.
+
 ## [0.5.0] — 2026-10-13 (R3 final)
 
 ### Added (since rc)
