@@ -15,6 +15,13 @@ export { SqliteStorage } from './memory/sqlite.ts';
 export { StorageRetriever, bm25Rank } from './memory/retrieval.ts';
 export type { Retriever, RetrievedChunk } from './memory/retrieval.ts';
 
+// Stage 2b — ES-compatible retrieval (xerj sidecar; Stage-1 evidence: parity
+// at ~400x lower latency, BM25-only by verdict)
+export { EsCompatRetriever } from './retrieval/es-compat.ts';
+export type { EsCompatOpts } from './retrieval/es-compat.ts';
+export { xerjSidecar, chunkToEsDoc, noteToEsDoc } from './xerj-sidecar.ts';
+export type { XerjSidecarOpts, XerjSidecarResult, EsCorpusDoc } from './xerj-sidecar.ts';
+
 // Stage 3 — source ingestion + chunking
 export { structuralChunks } from './chunk.ts';
 export type { StructuralChunk } from './chunk.ts';
