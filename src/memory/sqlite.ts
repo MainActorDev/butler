@@ -189,6 +189,18 @@ export class SqliteStorage implements Storage {
     return { turnId: row.turn_id, json: row.json };
   }
 
+  /** chat-reliability F1/F2: non-destructive peek — preparation validates without consuming. */
+  async peekPartial(sessionId: string): Promise<{ turnId: string; json: string; created_at: number } | null> {
+    const row = this.db.prepare('SELECT turn_id, json, created_at FROM butler_turn_partials WHERE session_id = ?').get(sessionId) as { turn_id: string; json: string; created_at: number } | undefined;
+    return row ? { turnId: row.turn_id, json: row.json, created_at: row.created_at } : null;
+  }
+
+  /** chat-reliability F1/F2: exact CAS delete — consumes the stash only if it
+   *  is still the exact (turnId, json) we snapshotted at the execution boundary. */
+  async consumePartialExact(sessionId: string, turnId: string, json: string): Promise<boolean> {
+    return this.db.prepare('DELETE FROM butler_turn_partials WHERE session_id = ? AND turn_id = ? AND json = ?').run(sessionId, turnId, json).changes > 0;
+  }
+
   async sessionMessages(sessionId: string): Promise<MessageRow[]> {
     return this.db.prepare('SELECT * FROM butler_messages WHERE session_id = ? ORDER BY rowid').all(sessionId) as MessageRow[];
   }
