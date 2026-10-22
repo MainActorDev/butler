@@ -189,6 +189,31 @@ export class SqliteStorage implements Storage {
     return { turnId: row.turn_id, json: row.json };
   }
 
+  /** chat-reliability F1/F2: non-destructive peek — preparation validates without consuming. */
+  async peekPartial(sessionId: string): Promise<{ turnId: string; json: string; created_at: number } | null> {
+    const row = this.db.prepare('SELECT turn_id, json, created_at FROM butler_turn_partials WHERE session_id = ?').get(sessionId) as { turn_id: string; json: string; created_at: number } | undefined;
+    return row ? { turnId: row.turn_id, json: row.json, created_at: row.created_at } : null;
+  }
+
+  /** chat-reliability F1/F2: exact CAS delete — consumes the stash only if it
+   *  is still the exact (turnId, json) we snapshotted at the execution boundary. */
+  async consumePartialExact(sessionId: string, turnId: string, json: string): Promise<boolean> {
+    return this.db.prepare('DELETE FROM butler_turn_partials WHERE session_id = ? AND turn_id = ? AND json = ?').run(sessionId, turnId, json).changes > 0;
+  }
+
+  /** chat-reliability finalizeOwned: sync, in-transaction session accounting. */
+  applyAccountingSync(sessionId: string, patch: { status?: 'active' | 'ended' | 'error'; tokensInDelta?: number; tokensOutDelta?: number }): void {
+    const cur = this.db.prepare('SELECT status, tokens_in, tokens_out FROM butler_sessions WHERE id = ?').get(sessionId) as { status: string; tokens_in: number; tokens_out: number } | undefined;
+    if (!cur) throw new Error(`session ${sessionId} not found`);
+    this.db.prepare('UPDATE butler_sessions SET status = ?, tokens_in = ?, tokens_out = ?, updated_at = ? WHERE id = ?')
+      .run(patch.status ?? cur.status, cur.tokens_in + (patch.tokensInDelta ?? 0), cur.tokens_out + (patch.tokensOutDelta ?? 0), Date.now(), sessionId);
+  }
+
+  /** chat-reliability finalizeOwned: sync, in-transaction budget-stash write. */
+  stashPartialSync(sessionId: string, turnId: string, json: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO butler_turn_partials(session_id, turn_id, json, created_at) VALUES (?,?,?,?)').run(sessionId, turnId, json, Date.now());
+  }
+
   async sessionMessages(sessionId: string): Promise<MessageRow[]> {
     return this.db.prepare('SELECT * FROM butler_messages WHERE session_id = ? ORDER BY rowid').all(sessionId) as MessageRow[];
   }

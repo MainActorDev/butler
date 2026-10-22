@@ -116,6 +116,20 @@ export interface Storage {
   // read — to seed the loop so the model continues instead of redoing hops.
   stashPartial(sessionId: string, turnId: string, json: string): Promise<void>;
   takePartial(sessionId: string): Promise<{ turnId: string; json: string } | null>;
+  /** chat-reliability F1/F2 (optional capability, authority-driven hosts):
+   *  non-destructive peek + exact compare-and-delete of the continuation
+   *  stash. The authority peeks during preparation and consumes ONLY at the
+   *  committed execution boundary, so a failed preparation never destroys a
+   *  continuation. */
+  peekPartial?(sessionId: string): Promise<{ turnId: string; json: string; created_at: number } | null>;
+  consumePartialExact?(sessionId: string, turnId: string, json: string): Promise<boolean>;
+  /** chat-reliability finalizeOwned: SYNCHRONOUS variants for use INSIDE the
+   *  atomic finalization transaction (better-sqlite3 forbids await in a
+   *  transaction; the async methods above cannot join the commit). Optional
+   *  capability — hosts requiring atomic finalization must use a driver that
+   *  provides them and verify it at startup. */
+  applyAccountingSync?(sessionId: string, patch: { status?: 'active' | 'ended' | 'error'; tokensInDelta?: number; tokensOutDelta?: number }): void;
+  stashPartialSync?(sessionId: string, turnId: string, json: string): void;
 
   // notes (explicit-write only; supersession, never delete)
   insertNote(n: Omit<NoteRow, 'id' | 'created_at' | 'superseded_by' | 'superseded_at' | 'superseded_reason'>): Promise<NoteRow>;

@@ -79,13 +79,18 @@ export type Effect =
 export class EventSink {
   private states = new Map<string, OrchestratorState>();
 
-  constructor(private readonly db: Database.Database, opts?: { enqueueRunTurn?: boolean }) {
+  constructor(private readonly db: Database.Database, opts?: { enqueueRunTurn?: boolean; passive?: boolean }) {
     db.exec(DDL);
     // v0.5.6: hosts that run turns INLINE (the conversation transport's own
     // runLoop) never consume runTurn effects — enqueueing them grows the outbox
     // forever (the 63-row backlog). Default stays true (worker-based hosts).
     this.enqueueRunTurn = opts?.enqueueRunTurn !== false;
-    this.recoverOrphans();
+    // chat-reliability F2: constructors are passive by choice now. The
+    // boot-time orphan sweep is a RECOVERY effect only the elected execution
+    // authority may run; a second sink (MCP context, read-only tool process)
+    // must never fail a live owner's turn on construction. Legacy callers
+    // keep the sweep unless they opt into passive mode.
+    if (opts?.passive !== true) this.recoverOrphans();
   }
   private readonly enqueueRunTurn: boolean;
 
@@ -139,6 +144,49 @@ export class EventSink {
    *  receipt + outbox). Returns the appended events and the enqueued effects.
    *  Idempotent per commandKey: a replayed command returns [] and no effects. */
   handle(sessionId: string, cmd: TurnCommand, commandKey: string): { events: TurnEvent[]; effects: Effect[] } {
+    return this.apply(sessionId, cmd, commandKey);
+  }
+
+  /** chat-reliability F1: handle a command with EXTRA durable writes (e.g. the
+   *  execution-ledger row) inside the SAME commit — admission is atomic across
+   *  events, projections, receipts and the caller's ledger insert. On any
+   *  throw the SQLite transaction rolls back and the in-memory state cache for
+   *  the session is DISCARDED (never a post-rollback poisoned cache). */
+  handleInTransaction(
+    sessionId: string,
+    cmd: TurnCommand,
+    commandKey: string,
+    alsoRun: ((db: Database.Database) => void) | undefined,
+  ): { events: TurnEvent[]; effects: Effect[] } {
+    return this.apply(sessionId, cmd, commandKey, alsoRun);
+  }
+
+  /** Drop the cached fold for a session (rollback/recovery discipline). */
+  invalidate(sessionId: string): void {
+    this.states.delete(sessionId);
+  }
+
+  /** chat-reliability F1/F2: run caller writes on the sink's OWN connection in
+   *  one transaction (nested sink calls become savepoints). The execution
+   *  authority composes its ledger rows with event writes here — two
+   *  connections to one file must never nest transactions. */
+  withTransaction<T>(fn: (db: Database.Database) => T): T {
+    const run = this.db.transaction(() => fn(this.db));
+    return run();
+  }
+
+  /** One consistent snapshot: folded state + events + lastSeq from the same
+   *  read boundary (chat-reliability common-read contract). */
+  readSnapshot(sessionId: string): { state: OrchestratorState; events: TurnEvent[]; lastSeq: number } {
+    return this.db.transaction(() => {
+      const events = this.events(sessionId);
+      let st = initialState(sessionId);
+      for (const e of events) st = fold(st, e);
+      return { state: st, events, lastSeq: events.length ? events[events.length - 1]!.seq : 0 };
+    })();
+  }
+
+  private apply(sessionId: string, cmd: TurnCommand, commandKey: string, alsoRun?: (db: Database.Database) => void): { events: TurnEvent[]; effects: Effect[] } {
     if (this.db.prepare('SELECT 1 FROM butler_command_receipts WHERE command_key = ?').get(commandKey)) {
       return { events: [], effects: [] };
     }
@@ -172,9 +220,18 @@ export class EventSink {
         const anyTurn = appended.some((e) => e.kind === 'turn.started');
         if (anyTurn) effects.push({ type: 'runTurn', sessionId, turnId: cmd.turnId });
       }
+      // caller's additional durable writes join THIS commit (F1 atomic admission)
+      alsoRun?.(this.db);
       this.db.prepare('INSERT OR IGNORE INTO butler_command_receipts(command_key, session_id, decided_at) VALUES (?,?,?)').run(commandKey, sessionId, now);
     });
-    txn();
+    try {
+      txn();
+    } catch (err) {
+      // rollback discipline: the cached fold may contain pre-rollback appends —
+      // discard it so the next read refolds from the durable log.
+      this.states.delete(sessionId);
+      throw err;
+    }
     // outbox rows AFTER the txn commits (the effect worker owns retirement)
     if (this.enqueueRunTurn) {
       for (const eff of effects) {

@@ -141,7 +141,7 @@ describe('loop — budgets (condition 2)', () => {
     expect((err as LoopError).code).toBe('ABORTED');
   });
 
-  it('never-responding provider → PROVIDER_TIMEOUT inside wall budget; session resumable (review F5)', async () => {
+  it('never-responding provider → wall budget kills it; loop-owned budget cause, resumable (review F5 + chat-reliability F3)', async () => {
     const provider = new MockProvider([{ kind: 'hang', ms: 10_000 }]);
     const t0 = Date.now();
     const err = await runLoop('sys', 'go', {
@@ -151,8 +151,11 @@ describe('loop — budgets (condition 2)', () => {
     }).catch((e: unknown) => e);
     const elapsed = Date.now() - t0;
     expect(err).toBeInstanceOf(LoopError);
+    // F3: the LOOP's wall expired (observed deadline signal), so this is a
+    // genuine budget outcome with an explicit cause — not a provider timeout.
     expect((err as LoopError).code).toBe('BUDGET_EXCEEDED');
-    expect((err as LoopError).message).toContain('PROVIDER_TIMEOUT');
+    expect((err as LoopError).cause).toBe('budget-wall');
+    expect((err as LoopError).message).toContain('wall budget exhausted');
     // the wall budget held: aborted well inside it (not 10s)
     expect(elapsed).toBeLessThan(3_000);
     // partial transcript persisted = resumable shape

@@ -54,7 +54,7 @@ export type TurnEvent =
   | (TurnEventBase & { kind: 'user_message.recorded'; detail: { role: 'user' | 'assistant'; content: string } })
   | (TurnEventBase & { kind: 'message.queued'; detail: { content: string; disposition: 'steering' | 'followup' } })
   | (TurnEventBase & { kind: 'queue.updated'; detail: { steering: string[]; followUp: string[] } })
-  | (TurnEventBase & { kind: 'chunk'; detail: { delta: string } })
+  | (TurnEventBase & { kind: 'chunk'; detail: { delta: string; block?: TurnChunkBlock } })
   | (TurnEventBase & { kind: 'tool_call'; detail: { toolCallId: string; name: string; arg?: string } })
   | (TurnEventBase & { kind: 'tool_call_update'; detail: { toolCallId: string; result?: string; isError?: boolean } })
   | (TurnEventBase & { kind: 'usage'; detail: UsageMeters })
@@ -65,13 +65,25 @@ export type TurnEvent =
 
 // ── Commands (the ONLY way state changes) ──
 
+/** chat-reliability F2 (text block lifecycle): durable block metadata riding
+ *  chunk commands. Additive and optional — legacy readers concatenate `delta`
+ *  exactly as before (start/end chunks carry an EMPTY delta). */
+export interface TurnChunkBlock {
+  id: string;
+  phase: 'start' | 'delta' | 'end';
+  /** provider-native block identity when one exists */
+  native?: string;
+  /** FULL block text — present on phase:'end' */
+  text?: string;
+}
+
 export type TurnCommand =
   | { kind: 'session.import'; sessionId: string; note: string }
   | { kind: 'turn.request'; sessionId: string; turnId: string; prompt: string; refIds: string[]; at: number }
   | { kind: 'message.append'; sessionId: string; role: 'user' | 'assistant'; content: string; narrative?: boolean }
   | { kind: 'message.queue'; sessionId: string; content: string; disposition: 'steering' | 'followup' }
   | { kind: 'turn.start'; sessionId: string; turnId: string }
-  | { kind: 'turn.chunk'; sessionId: string; turnId: string; delta: string }
+  | { kind: 'turn.chunk'; sessionId: string; turnId: string; delta: string; block?: TurnChunkBlock }
   | { kind: 'turn.tool'; sessionId: string; turnId: string; phase: 'call' | 'update'; toolCallId: string; name?: string; arg?: string; result?: string; isError?: boolean }
   | { kind: 'turn.usage'; sessionId: string; turnId: string; meters: UsageMeters }
   | { kind: 'turn.compaction'; sessionId: string; turnId: string; summary: string; preservedEventIds: string[] }
@@ -148,7 +160,9 @@ export function decide(state: OrchestratorState, cmd: TurnCommand): TurnEvent[] 
     case 'turn.chunk': {
       const t = state.turns.find((x) => x.id === cmd.turnId);
       if (!t || t.status !== 'running') return [];
-      return [{ ...S(cmd.turnId), kind: 'chunk', detail: { delta: cmd.delta } }];
+      // F2: `block` rides along additively (absent on legacy chunks); the fold
+      // reads only the fields it knows and ignores any other unknown field.
+      return [{ ...S(cmd.turnId), kind: 'chunk', detail: { delta: cmd.delta, ...(cmd.block !== undefined ? { block: cmd.block } : {}) } }];
     }
 
     case 'turn.tool': {
