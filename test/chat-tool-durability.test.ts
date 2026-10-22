@@ -107,6 +107,36 @@ describe('runtime tool durability', () => {
     }
   });
 
+  it('harness onTool events WITHOUT native ids get allocated identity — same-name stays distinct', async () => {
+    const provider: Provider = {
+      model: 'harness-same-name',
+      async complete(_m, _t, o) {
+        for (const value of ['one', 'two']) {
+          o.onTool?.({ phase: 'call', name: 'probe', arg: value });
+          o.onTool?.({ phase: 'result', name: 'probe', result: value });
+        }
+        return { message: { role: 'assistant', content: 'done' }, finishReason: 'stop', usage: null };
+      },
+    };
+    const rig = await boot(provider);
+    try {
+      const created = await (await fetch(`${rig.url}/api/agent/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).json() as { session: { id: string } };
+      const res = await fetch(`${rig.url}/api/agent/sessions/${created.session.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'run twice' }) });
+      expect(res.status).toBe(200);
+      const events = rig.sink.events(created.session.id);
+      const calls = events.filter((e) => e.kind === 'tool_call');
+      const ids = calls.map((c) => String((c.detail as { toolCallId?: string }).toolCallId));
+      expect(calls).toHaveLength(2); // PREVIOUSLY 1 — name fallback collapsed the invocations
+      expect(new Set(ids).size).toBe(2);
+      expect(ids.every((id) => id.includes('_i_alloc_'))).toBe(true); // allocated identity, not name-derived
+      const args = calls.map((c) => String((c.detail as { arg?: string }).arg));
+      expect(args).toEqual(['one', 'two']);
+    } finally {
+      await rig.app.close();
+      rig.storage.close();
+    }
+  });
+
   it('a failed tool handler records an isError update, never a silent success', async () => {
     const provider = new AnsweringProvider([
       { toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"boom"}' } }] },

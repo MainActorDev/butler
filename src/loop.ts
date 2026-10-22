@@ -135,6 +135,13 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     // the caller signal happens only here, at the provider seam.
     const wallDeadline = AbortSignal.timeout(remainingMs);
     const wallSignal = AbortSignal.any(deps.signal ? [wallDeadline, deps.signal] : [wallDeadline]);
+    // chat-reliability identity contract: harness tool events without a
+    // provider-native id get one ALLOCATED at first observation — never key
+    // durability by tool name (repeated same-name invocations must stay
+    // distinct). Pairing call→result is FIFO per name WITHIN this provider
+    // call only (a deterministic window); an unpaired result stays uncorrelated.
+    const harnessPending = new Map<string, string[]>();
+    let harnessSeq = 0;
     let res;
     // F2: the LOOP accumulates the streamed text itself (sum of deltas) — the
     // completed message's content may differ from the stream (claude-cli
@@ -143,7 +150,24 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     try {
       // streaming: the EVENT always flows (WS UIs); the direct callback stays
       // opt-in for hosts that want it without the event bus
-      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { streamedText += d; tracker?.onDelta(hop, d); deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => { deps.onTool?.(e); deps.onEvent?.({ type: 'turn.tool', hop, detail: e }); } });
+      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { streamedText += d; tracker?.onDelta(hop, d); deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => {
+          let out = e;
+          if (e.invocationId === undefined) {
+            const pending = harnessPending.get(e.name) ?? [];
+            if (e.phase === 'call') {
+              const id = `alloc_${hop}_${harnessSeq++}`;
+              pending.push(id);
+              harnessPending.set(e.name, pending);
+              out = { ...e, invocationId: id };
+            } else {
+              const id = pending.shift();
+              harnessPending.set(e.name, pending);
+              if (id !== undefined) out = { ...e, invocationId: id };
+            }
+          }
+          deps.onTool?.(out);
+          deps.onEvent?.({ type: 'turn.tool', hop, detail: out });
+        } });
     } catch (err) {
       // F3 classification, by precedence: an observed caller abort wins
       // (explicit Stop beats everything, even a concurrent wall expiry), then
