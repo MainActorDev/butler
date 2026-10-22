@@ -1,3 +1,38 @@
+## [Unreleased] (detached send, server-owned queue, steering, push-on-append)
+
+### Added
+- **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`
+  (requires an execution authority; else `400 DETACH_UNSUPPORTED`) answers at once:
+  `202 {startedTurnId}` when idle, `202 {queued: {queueId, disposition}}` when busy
+  (`mode: 'steer' | 'queue'`). Without `detach` the route is unchanged (held response).
+- **Server-owned queue** — identity-bearing `message.queued` (`queueId`, `body {commands, model}`,
+  request id + principal + fingerprint), one `queue.removed {queueId, reason: claimed | deleted |
+  delivered}` row per removal, `queue.updated` snapshots gain parallel `ids`.
+  `DELETE /api/agent/sessions/:id/queue/:queueId` removes a pending item.
+- **Claim-all drain** — when any admitted turn (held or detached) settles, or the authority
+  becomes ready at boot, every pending item runs as ONE next turn. The claim, the user row
+  (`content` = the items' own text, `items[]`) and `turn.started` commit in one transaction;
+  the composed prompt (`[N queued messages]` + items) goes only to the model. Legacy queue rows
+  without ids are never auto-run. A runaway guard refuses to claim an id twice in one process.
+- **Steering** — `LoopDeps.takeSteering` is called at each tool boundary; the transport's
+  `steer.deliver` command records `queue.removed (delivered)`, `steer.delivered` and a
+  `user_message.recorded {via: 'steer'}` row (so later turns keep it in model history) in one commit.
+- **Duplicate-submit guard** — before reservation, a detached send's `clientRequestId` is looked
+  up across admitted turns and every queued item (pending or gone): same content → the existing
+  `startedTurnId` / `queueId`, different content → `409 REQUEST_ID_REUSE`.
+- **`EventSink.onAppend(listener)`** — committed rows pushed per session, only after the
+  outermost transaction commits; rollbacks are never pushed; listener faults are isolated.
+- **`ExecutionAuthority.beginShutdown()`** — closing gate: nothing new is reserved after it, so a
+  turn settling during shutdown cannot start queued work. Hosts call it before aborting turns.
+- **`session.notice {level, text}`** row kind; written when a detached turn's finalization keeps
+  failing after bounded retries (`ConversationDeps.finalizeRetryMs`, default 1s/5s/30s; the retry
+  stops at shutdown and leaves the attempt reserved for recovery).
+
+### Fixed
+- Tool events without an invocation id get a per-turn counter id (`tc_<turn>_n<k>`, paired FIFO
+  by name) instead of the bare tool name, in the conversation transport and workflow runs.
+- `TurnEventBase.seq` comment: per-session, not per-turn (the schema is `UNIQUE(session_id, seq)`).
+
 ## [0.8.0] — 2026-10-21 (Stage 3: tree-sitter symbols + watchRoots + structured search)
 
 ### Added
