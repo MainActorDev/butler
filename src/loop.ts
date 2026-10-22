@@ -5,6 +5,8 @@
  *  via the persistence hook. */
 import type { Provider, ProviderMessage, ProviderTool } from './provider/index.ts';
 import { ProviderError } from './provider/index.ts';
+import type { TextBlockActivity } from './provider/activity.ts';
+import { createBlockTracker } from './provider/activity.ts';
 
 /** Loop failure codes. Budget/abort/invalid are loop-owned outcomes;
  *  PROVIDER_* codes classify provider failures (chat-reliability F3: the loop
@@ -92,6 +94,11 @@ export interface LoopDeps {
   onTool?: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => void;
   /** R3 decision 4: opt INTO the hard token cap (fan-out children); default advisory */
   hardTokenCap?: boolean;
+  /** chat-reliability F2 (text block lifecycle): per-block activity for the
+   *  durable chunk rail — start/delta/end per assistant message (hop), so a
+   *  replayed log can separate consecutive hops' narration instead of gluing
+   *  it. Purely additive: absent → behavior identical to before. */
+  onActivity?: (a: TextBlockActivity) => void;
   signal?: AbortSignal;
 }
 
@@ -111,6 +118,9 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
   ];
   const tokens = { in: 0, out: 0 };
   let repairs = 0;
+  // chat-reliability F2: the block tracker runs only when a consumer asked
+  // for block activity; block ids are hop-scoped and stable per run.
+  const tracker = deps.onActivity ? createBlockTracker(deps.onActivity, (h) => `blk_h${h}`) : undefined;
 
   for (let hop = 1; hop <= budget.maxHops; hop++) {
     if (deps.signal?.aborted) throw new LoopError('aborted by caller', 'ABORTED', messages, 'caller-abort');
@@ -126,10 +136,14 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     const wallDeadline = AbortSignal.timeout(remainingMs);
     const wallSignal = AbortSignal.any(deps.signal ? [wallDeadline, deps.signal] : [wallDeadline]);
     let res;
+    // F2: the LOOP accumulates the streamed text itself (sum of deltas) — the
+    // completed message's content may differ from the stream (claude-cli
+    // snapshot vs partial stream), so text.end must not trust content.
+    let streamedText = '';
     try {
       // streaming: the EVENT always flows (WS UIs); the direct callback stays
       // opt-in for hosts that want it without the event bus
-      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => { deps.onTool?.(e); deps.onEvent?.({ type: 'turn.tool', hop, detail: e }); } });
+      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { streamedText += d; tracker?.onDelta(hop, d); deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => { deps.onTool?.(e); deps.onEvent?.({ type: 'turn.tool', hop, detail: e }); } });
     } catch (err) {
       // F3 classification, by precedence: an observed caller abort wins
       // (explicit Stop beats everything, even a concurrent wall expiry), then
@@ -151,6 +165,12 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     // F3: the guard fires only when the caller signal is actually observed
     // aborted; ordinary success passes untouched.
     if (deps.signal?.aborted) throw new LoopError('aborted by caller', 'ABORTED', messages, 'caller-abort');
+
+    // F2: close the hop's text block BEFORE the message lands. text.end prefers
+    // the STREAMED accumulation when any deltas flowed (byte-exact to what the
+    // UI saw); content is the fallback for snapshot-only hops (which usually
+    // have no block at all — then the tracker emits nothing).
+    if (tracker) tracker.onMessageComplete(hop, streamedText !== '' ? streamedText : (res.message.content ?? ''));
 
     if (res.usage) { tokens.in += res.usage.promptTokens; tokens.out += res.usage.completionTokens; }
     messages.push(res.message);

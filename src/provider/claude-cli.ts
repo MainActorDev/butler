@@ -25,7 +25,7 @@ export interface ClaudeCliEvent {
   result?: string;
   usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null;
   tool_use_id?: string;
-  message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown; is_error?: boolean; content?: unknown }> };
+  message?: { content?: Array<{ type: string; text?: string; name?: string; id?: string; tool_use_id?: string; input?: unknown; is_error?: boolean; content?: unknown }> };
   error?: string;
   /** v0.5.3 --include-partial-messages: Anthropic SSE events wrapped by the CLI
    *  as {type:'stream_event', event:{...}}. content_block_delta carries
@@ -100,7 +100,7 @@ export class ClaudeCliProvider implements Provider {
   async complete(
     messages: ProviderMessage[],
     _tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
   ): Promise<ProviderResponse> {
     // v0.5.5: the CLI cold-start race leaves MCP servers 'pending' at init —
     // the model would see zero tools (sess_88de6757). Serialization prevents
@@ -127,7 +127,7 @@ export class ClaudeCliProvider implements Provider {
   private async completeOnce(
     messages: ProviderMessage[],
     _tools: ProviderTool[],
-    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
+    opts: { remainingMs: number; signal?: AbortSignal | undefined; onDelta?: (delta: string) => void; onTool?: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => void; sessionKey?: string },
   ): Promise<ProviderResponse> {
     const bin = (this.cfg as { binPath?: string }).binPath ?? 'claude';
     // R2-F4: isolation — the caller's key addresses its OWN claude session
@@ -192,8 +192,14 @@ export class ClaudeCliProvider implements Provider {
       let stderr = '';
       const events: ClaudeCliEvent[] = [];
       let settled = false;
-      // correlate tool_results to calls by ORDER (result blocks carry no name)
-  const pendingCalls: string[] = [];
+  // correlate tool_results to calls by ORDER (result blocks carry no name);
+  // chat-reliability F2(b): entries keep the provider-NATIVE tool_use id so
+  // results correlate to the same invocation the durable rail keyed.
+  const pendingCalls: Array<{ name: string; id?: string }> = [];
+  // F2(a): text_delta bytes streamed since the last assistant snapshot — the
+  // completed snapshot must REPLACE/complete the streamed block, never
+  // re-emit bytes the stream already delivered (duplicated narration).
+  let streamedSinceSnapshot = '';
   const onLine = (line: string): void => {
         const t = line.trim();
         if (!t) return;
@@ -228,21 +234,35 @@ export class ClaudeCliProvider implements Provider {
         if (ev.type === 'stream_event') {
           const se = ev.event;
           if (se?.type === 'content_block_delta' && se.delta?.type === 'text_delta' && se.delta.text) {
+            streamedSinceSnapshot += se.delta.text;
             opts.onDelta?.(se.delta.text); // the answer tokens, live
           }
           return; // thinking_delta & infrastructure events; the full assistant message still arrives
         }
         if (ev.type === 'assistant' && ev.message?.content) {
+          // F2(a): the completed assistant message is the SNAPSHOT of the block
+          // the stream (if any) already delivered. Never re-emit streamed bytes:
+          //  - nothing streamed → snapshot-only mode: the blocks ARE the stream
+          //  - snapshot extends the stream (cut mid-block) → emit only the tail
+          //  - snapshot already streamed → emit nothing; its completion lands
+          //    as the loop's text.end, not as duplicated deltas
+          const textBlocks = (ev.message.content ?? [])
+            .filter((b) => b.type === 'text' && b.text && !INTERNAL_PROGRESS.has(b.text.trim()))
+            .map((b) => b.text as string);
+          const snapshot = textBlocks.join('\n\n');
+          if (streamedSinceSnapshot === '') {
+            for (const t of textBlocks) opts.onDelta?.(t);
+          } else if (snapshot.startsWith(streamedSinceSnapshot) && snapshot.length > streamedSinceSnapshot.length) {
+            opts.onDelta?.(snapshot.slice(streamedSinceSnapshot.length));
+          }
+          streamedSinceSnapshot = '';
           for (const blk of ev.message.content) {
-            if (blk.type === 'text' && blk.text) {
-              if (!INTERNAL_PROGRESS.has(blk.text.trim())) opts.onDelta?.(blk.text);
-            }
             if (blk.type === 'tool_use') {
               const sum = inputSummary(blk.input);
               const nm = blk.name ?? 'tool';
-              pendingCalls.push(nm);
-              if (sum) opts.onTool?.({ phase: 'call', name: nm, arg: sum });
-              else opts.onTool?.({ phase: 'call', name: nm });
+              pendingCalls.push({ name: nm, ...(blk.id !== undefined ? { id: blk.id } : {}) });
+              if (sum) opts.onTool?.({ phase: 'call', name: nm, arg: sum, ...(blk.id !== undefined ? { invocationId: blk.id } : {}) });
+              else opts.onTool?.({ phase: 'call', name: nm, ...(blk.id !== undefined ? { invocationId: blk.id } : {}) });
             }
           }
         }
@@ -251,12 +271,18 @@ export class ClaudeCliProvider implements Provider {
             if (blk.type !== 'tool_result') continue;
             const text = typeof blk.content === 'string' ? blk.content
               : Array.isArray(blk.content) ? (blk.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join(' ') : '';
-            const head = text.trim().split('\n')[0] ?? '';
-            if (head) {
-              const nm = pendingCalls.shift() ?? 'tool';
-              if (blk.is_error) opts.onTool?.({ phase: 'result', name: nm, result: head.slice(0, 160), isError: true });
-              else opts.onTool?.({ phase: 'result', name: nm, result: head.slice(0, 160) });
-            }
+            // F2(c): FULL results — no first-line reduction, no 160-char clip,
+            // and EMPTY results are recorded honestly (result:'', isError:false)
+            // instead of being dropped from the trace.
+            const pending = pendingCalls.shift() ?? { name: 'tool' };
+            const invocationId = blk.tool_use_id ?? pending.id;
+            opts.onTool?.({
+              phase: 'result',
+              name: pending.name,
+              ...(invocationId !== undefined ? { invocationId } : {}),
+              result: text,
+              isError: Boolean(blk.is_error),
+            });
           }
         }
       };

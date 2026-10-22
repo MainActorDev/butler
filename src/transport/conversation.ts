@@ -8,6 +8,7 @@ import { runLoop, LoopError } from '../loop.ts';
 import type { EventSink } from '../orchestrate/event-sink.ts';
 import type { ExecutionAuthority, ExecutionAttempt } from '../orchestrate/execution-authority.ts';
 import type { TurnCommand } from '../orchestrate/turn-engine.ts';
+import type { TextBlockActivity } from '../provider/activity.ts';
 import type { Provider, ProviderMessage, ProviderResponse, ProviderTool } from '../provider/index.ts';
 import type { Policy, ToolRegistry } from '../tools.ts';
 import type { TurnEvent } from '../loop.ts';
@@ -212,6 +213,31 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       if (exec && ownedAttempt) exec.handleOwned(ownedAttempt, id, cmd, key);
       else if (deps.sink) deps.sink.handle(id, cmd, key);
     };
+    // chat-reliability F2 (text block lifecycle): durable block metadata for
+    // the chunk rail, derived from the loop's block tracker (onActivity).
+    // start/end persist as their own chunk commands with an EMPTY scalar
+    // delta — the delta text still rides its own delta-phase chunk, so the
+    // concatenated scalar stream stays byte-exact and legacy readers are
+    // untouched. Per-delta chunks gain block identity via the per-request
+    // hop→block map (text.delta needs no command of its own).
+    const blockRail = () => {
+      const byHop = new Map<number, { id: string; native?: string }>();
+      return {
+        onActivity: (a: TextBlockActivity): void => {
+          if (!deps.sink && !exec) return;
+          if (a.type === 'text.start') {
+            byHop.set(a.hop, { id: a.blockId, ...(a.native !== undefined ? { native: a.native } : {}) });
+            durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: '', block: { id: a.blockId, phase: 'start', ...(a.native !== undefined ? { native: a.native } : {}) } } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+          } else if (a.type === 'text.end') {
+            durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: '', block: { id: a.blockId, phase: 'end', ...(a.native !== undefined ? { native: a.native } : {}), text: a.text } } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+          }
+        },
+        blockFor: (hop: number): { id: string; phase: 'delta'; native?: string } | undefined => {
+          const b = byHop.get(hop);
+          return b ? { id: b.id, phase: 'delta' as const, ...(b.native !== undefined ? { native: b.native } : {}) } : undefined;
+        },
+      };
+    };
     // These survive the preparation window — declared OUTSIDE the prep try so
     // the execution section can read them (block scoping).
     let resumeNote = '';
@@ -364,6 +390,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           resumeNote = '\n\n[resume] The previous turn on this session ran out of runway mid-task. Its full transcript, including tool results, is prepended to the history below. Continue that work from where it stopped — do not repeat completed steps.';
         }
       }
+      const blocks = blockRail();
       const result = await (exec && ownedAttempt
         ? exec.trackWorker({ turnId: durableTurnId, identity: { seam: 'provider' } }, 'provider', () => runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, content, {
             sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
@@ -395,10 +422,13 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
               if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
               else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
             },
+            // F2: block start/end ride their own chunk commands; per-delta
+            // chunks pick up block identity in the onEvent chunk handler.
+            onActivity: blocks.onActivity,
             onEvent: (e) => {
               deps.emit({ ...e, sessionId: id });
               if (sink || exec) {
-                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta), ...(blocks.blockFor(e.hop) ? { block: blocks.blockFor(e.hop) } : {}) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
                 if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
                   const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
                   if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
@@ -430,10 +460,13 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
               if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
               else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
             },
+            // F2: block start/end ride their own chunk commands; per-delta
+            // chunks pick up block identity in the onEvent chunk handler.
+            onActivity: blocks.onActivity,
             onEvent: (e) => {
               deps.emit({ ...e, sessionId: id });
               if (sink || exec) {
-                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta), ...(blocks.blockFor(e.hop) ? { block: blocks.blockFor(e.hop) } : {}) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
                 if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
                   const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
                   if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
