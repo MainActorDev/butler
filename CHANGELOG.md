@@ -1,4 +1,4 @@
-## [Unreleased] (detached send, server-owned queue, steering, push-on-append)
+## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget)
 
 ### Added
 - **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`
@@ -27,6 +27,12 @@
 - **`session.notice {level, text}`** row kind; written when a detached turn's finalization keeps
   failing after bounded retries (`ConversationDeps.finalizeRetryMs`, default 1s/5s/30s; the retry
   stops at shutdown and leaves the attempt reserved for recovery).
+
+- **`SourceConnector.maxChunks`** — per-source chunk budget for `ingest()` (default stays
+  `MAX_CHUNKS_PER_SOURCE` = 10,000). `RepoSourceConfig.maxChunks` passes it through
+  `repoConnector`. Symbol docs carry one chunk per symbol, so a mid-size repo passes the
+  default; the walk is alphabetical, so the overflow dropped the later top-level directories
+  (recorded in `skipped`, easy to miss).
 
 ### Fixed
 - Tool events without an invocation id get a per-turn counter id (`tc_<turn>_n<k>`, paired FIFO
