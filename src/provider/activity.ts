@@ -24,17 +24,19 @@ export type TextBlockActivity = { type: 'text.start' | 'text.delta' | 'text.end'
 export function createBlockTracker(
   emit: (a: TextBlockActivity) => void,
   allocBlockId: (hop: number) => string,
-): { onDelta(hop: number, delta: string): void; onMessageComplete(hop: number, fullText: string): void } {
+): { onDelta(hop: number, delta: string): string | undefined; onMessageComplete(hop: number, fullText: string): void } {
   let open: { hop: number; blockId: string } | null = null;
   return {
-    onDelta(hop: number, delta: string): void {
+    onDelta(hop: number, delta: string): string | undefined {
       if (!open || open.hop !== hop) {
         // a fresh hop opens a fresh block; an unclosed prior block is simply
         // left unterminated — its deltas are already durable downstream.
         open = { hop, blockId: allocBlockId(hop) };
         emit({ type: 'text.start', hop, blockId: open.blockId, text: delta });
+        return open.blockId;
       }
       emit({ type: 'text.delta', hop, blockId: open.blockId, text: delta });
+      return open.blockId;
     },
     onMessageComplete(hop: number, fullText: string): void {
       if (!open || open.hop !== hop) return; // no deltas streamed → no block → nothing to end

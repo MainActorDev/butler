@@ -150,7 +150,7 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     try {
       // streaming: the EVENT always flows (WS UIs); the direct callback stays
       // opt-in for hosts that want it without the event bus
-      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { streamedText += d; tracker?.onDelta(hop, d); deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => {
+      res = await deps.provider.complete(messages, toolDefs(deps.tools), { remainingMs, signal: wallSignal, ...(deps.sessionKey !== undefined ? { sessionKey: deps.sessionKey } : {}), onDelta: (d: string) => { streamedText += d; const bid = tracker?.onDelta(hop, d); deps.onDelta?.(d); deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: d, ...(bid !== undefined ? { blockId: bid } : {}) } }); }, onTool: (e: { phase: 'call' | 'result'; name: string; invocationId?: string; arg?: string; result?: string; isError?: boolean }) => {
           let out = e;
           if (e.invocationId === undefined) {
             const pending = harnessPending.get(e.name) ?? [];

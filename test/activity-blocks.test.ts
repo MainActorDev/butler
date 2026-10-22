@@ -129,6 +129,43 @@ describe('text block lifecycle durability (F2)', () => {
     }
   });
 
+  it('turn.delta bus events carry the live blockId; absent without a block', async () => {
+    const events: Array<{ type: string; hop: number; detail?: { delta?: string; blockId?: string } }> = [];
+    const dir = mkdtempSync(join(tmpdir(), 'butler-blkdur-'));
+    dirs.push(dir);
+    const storage = new SqliteStorage(join(dir, 'agent.db'));
+    const sink = new EventSink(storage['db'] as InstanceType<typeof Database>, { passive: true, enqueueRunTurn: false });
+    const registry = new ToolRegistry().register({
+      name: 'probe', description: 'p', permission: 'read', parameters: { type: 'object', properties: { q: { type: 'string' } } },
+      execute: async (args) => `observed:${String(args['q'])}`,
+    });
+    const provider = new StreamingProvider([
+      { deltas: ['a', 'b'], toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"x"}' } }] },
+      { deltas: ['c'], content: 'abc' },
+    ]);
+    const app = Fastify();
+    await registerConversationApi(app, {
+      storage, provider, registry, policy: { name: 'draft', allows: 'draft' },
+      systemPrompt: 'sys',
+      emit: (e) => { events.push(e as unknown as { type: string; hop: number; detail?: { delta?: string; blockId?: string } }); },
+      sink,
+    });
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    try {
+      const created = await (await fetch(`http://127.0.0.1:${(app.server.address() as { port: number }).port}/api/agent/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).json() as { session: { id: string } };
+      const res = await fetch(`http://127.0.0.1:${(app.server.address() as { port: number }).port}/api/agent/sessions/${created.session.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'stream two hops' }) });
+      expect(res.status).toBe(200);
+      const deltas = events.filter((e) => e.type === 'turn.delta');
+      expect(deltas.map((e) => e.detail?.delta)).toEqual(['a', 'b', 'c']);
+      expect(deltas[0]!.detail?.blockId).toBe('blk_h1'); // hops are 1-indexed
+      expect(deltas[1]!.detail?.blockId).toBe('blk_h1');
+      expect(deltas[2]!.detail?.blockId).toBe('blk_h2'); // tool hop → NEW block id
+    } finally {
+      await app.close();
+      storage.close();
+    }
+  });
+
   it('a hop with no deltas emits no block', async () => {
     const provider = new StreamingProvider([
       { toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"silent"}' } }] }, // no deltas
