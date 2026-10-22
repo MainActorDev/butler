@@ -26,6 +26,9 @@ export interface SourceConnector {
   readonly sourceId: string;
   /** fetch documents for the source's current scope; cheap when cached */
   fetch(signal?: AbortSignal | undefined): Promise<NormalizedDocument[]>;
+  /** per-source chunk budget for ingest() (default MAX_CHUNKS_PER_SOURCE).
+   *  Docs past it are recorded in `skipped`, not ingested. */
+  readonly maxChunks?: number;
 }
 
 export const MAX_TEXT_BYTES = 2 * 1024 * 1024; // D12: 2 MB text/doc
@@ -57,6 +60,7 @@ export async function ingest(
   // the source row must exist before documents reference it (FK) — upsert it
   await storage.upsertSource({ id: connector.sourceId, kind: connector.kind, config_json: '{}', status: 'active', last_synced_at: Date.now() });
   let totalChunks = 0;
+  const maxChunks = connector.maxChunks ?? MAX_CHUNKS_PER_SOURCE;
 
   for (const doc of docs) {
     if (opts.signal?.aborted) break;
@@ -92,8 +96,8 @@ export async function ingest(
     let chunks: Array<Omit<ChunkRow, 'id' | 'doc_sha256'>> = [];
     if (isText) {
       chunks = (doc.chunks ?? structuralChunks(doc.content!, doc.kind)).map((c) => ({ ordinal: c.ordinal, heading_path: c.headingPath, content: c.content, tokens: c.tokens }));
-      if (totalChunks + chunks.length > MAX_CHUNKS_PER_SOURCE) {
-        chunks = chunks.slice(0, Math.max(0, MAX_CHUNKS_PER_SOURCE - totalChunks));
+      if (totalChunks + chunks.length > maxChunks) {
+        chunks = chunks.slice(0, Math.max(0, maxChunks - totalChunks));
         if (chunks.length === 0) { out.skipped.push({ uri: doc.uri, reason: 'chunk cap reached for source' }); continue; }
       }
       totalChunks += chunks.length;
