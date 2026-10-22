@@ -32,7 +32,7 @@ export type LoopErrorCause =
   | 'tool-invalid';
 
 export class LoopError extends Error {
-  constructor(message: string, readonly code: LoopErrorCode, readonly partial: ProviderMessage[], readonly cause?: LoopErrorCause, readonly status?: number) {
+  constructor(message: string, readonly code: LoopErrorCode, readonly partial: ProviderMessage[], override readonly cause?: LoopErrorCause, readonly status?: number) {
     super(message);
     this.name = 'LoopError';
   }
