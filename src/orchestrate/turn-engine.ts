@@ -19,7 +19,7 @@ export interface TurnEventBase {
   session_id: string;
   parent_id: string | null;      // pi: tree-ready from day one (nullable column)
   schema_version: number;        // frozen-migration discipline (dsh)
-  seq: number;                   // per-turn monotonic, assigned by the sink
+  seq: number;                   // per-SESSION monotonic, assigned by the sink (UNIQUE(session_id, seq))
   at: number;                    // epoch ms, assigned by the sink
 }
 
@@ -30,6 +30,9 @@ export type TurnEventKind =
   | 'user_message.recorded'
   | 'message.queued'             // pi: follow-up queue entry (decided, visible)
   | 'queue.updated'              // pi: steering/follow-up queue state changes
+  | 'queue.removed'              // one item left the queue (claimed | deleted | delivered)
+  | 'steer.delivered'            // steering items handed to the running turn
+  | 'session.notice'             // generic host-visible notice (info | warn | error)
   | 'chunk'                      // assistant text delta
   | 'tool_call'                  // ACP entity: first sighting fixes timeline position
   | 'tool_call_update'           // ACP patch by toolCallId (never order-correlation)
@@ -51,9 +54,12 @@ export type TurnEvent =
   | (TurnEventBase & { kind: 'session.imported'; detail: { note: string } })
   | (TurnEventBase & { kind: 'turn.requested'; detail: { prompt: string; refIds: string[] } })
   | (TurnEventBase & { kind: 'turn.started'; detail: {} })
-  | (TurnEventBase & { kind: 'user_message.recorded'; detail: { role: 'user' | 'assistant'; content: string } })
-  | (TurnEventBase & { kind: 'message.queued'; detail: { content: string; disposition: 'steering' | 'followup' } })
-  | (TurnEventBase & { kind: 'queue.updated'; detail: { steering: string[]; followUp: string[] } })
+  | (TurnEventBase & { kind: 'user_message.recorded'; detail: { role: 'user' | 'assistant'; content: string; items?: QueueItemRef[]; via?: 'steer' } })
+  | (TurnEventBase & { kind: 'message.queued'; detail: { content: string; disposition: 'steering' | 'followup' } & QueuedIdentity })
+  | (TurnEventBase & { kind: 'queue.updated'; detail: { steering: string[]; followUp: string[]; ids?: { steering: string[]; followUp: string[] } } })
+  | (TurnEventBase & { kind: 'queue.removed'; detail: { queueId: string; reason: QueueRemovalReason } })
+  | (TurnEventBase & { kind: 'steer.delivered'; detail: { items: QueueItemRef[] } })
+  | (TurnEventBase & { kind: 'session.notice'; detail: { level: NoticeLevel; text: string } })
   | (TurnEventBase & { kind: 'chunk'; detail: { delta: string; block?: TurnChunkBlock } })
   | (TurnEventBase & { kind: 'tool_call'; detail: { toolCallId: string; name: string; arg?: string } })
   | (TurnEventBase & { kind: 'tool_call_update'; detail: { toolCallId: string; result?: string; isError?: boolean } })
@@ -62,6 +68,24 @@ export type TurnEvent =
   | (TurnEventBase & { kind: 'turn.completed'; detail: { answer: string } })
   | (TurnEventBase & { kind: 'turn.failed'; detail: { error: string; partial?: string } })
   | (TurnEventBase & { kind: 'turn.aborted'; detail: { reason: string } });
+
+// ── Queue item identity (detached send / steer / claim-all drain) ──
+
+/** A queue item as carried on user rows and steer deliveries. */
+export interface QueueItemRef { queueId: string; content: string }
+export type QueueRemovalReason = 'claimed' | 'deleted' | 'delivered';
+export type NoticeLevel = 'info' | 'warn' | 'error';
+/** Host-supplied request options a queued item keeps until it runs. */
+export interface QueuedBody { commands?: string[]; model?: string }
+/** Additive identity on `message.queued` (absent on legacy rows). */
+export interface QueuedIdentity {
+  queueId?: string;
+  body?: QueuedBody;
+  /** duplicate-submit guard: the host's client request id + principal + content fingerprint */
+  requestId?: string;
+  principalId?: string;
+  fingerprint?: string;
+}
 
 // ── Commands (the ONLY way state changes) ──
 
@@ -79,9 +103,17 @@ export interface TurnChunkBlock {
 
 export type TurnCommand =
   | { kind: 'session.import'; sessionId: string; note: string }
-  | { kind: 'turn.request'; sessionId: string; turnId: string; prompt: string; refIds: string[]; at: number }
+  /** `display`/`items`: the text recorded as the user message (and kept in
+   *  model history) when it differs from the composed `prompt`; `claim`:
+   *  queue ids removed (reason `claimed`) in the SAME decision that starts
+   *  the turn — a crash can never both start the turn and keep the items. */
+  | { kind: 'turn.request'; sessionId: string; turnId: string; prompt: string; refIds: string[]; at: number; display?: string; items?: QueueItemRef[]; claim?: string[] }
   | { kind: 'message.append'; sessionId: string; role: 'user' | 'assistant'; content: string; narrative?: boolean }
-  | { kind: 'message.queue'; sessionId: string; content: string; disposition: 'steering' | 'followup' }
+  | ({ kind: 'message.queue'; sessionId: string; content: string; disposition: 'steering' | 'followup' } & QueuedIdentity)
+  | { kind: 'queue.remove'; sessionId: string; queueId: string; reason: QueueRemovalReason }
+  /** hand every pending steering item in `queueIds` to the running turn */
+  | { kind: 'steer.deliver'; sessionId: string; turnId: string; queueIds: string[] }
+  | { kind: 'session.notice'; sessionId: string; turnId?: string; level: NoticeLevel; text: string }
   | { kind: 'turn.start'; sessionId: string; turnId: string }
   | { kind: 'turn.chunk'; sessionId: string; turnId: string; delta: string; block?: TurnChunkBlock }
   | { kind: 'turn.tool'; sessionId: string; turnId: string; phase: 'call' | 'update'; toolCallId: string; name?: string; arg?: string; result?: string; isError?: boolean }
@@ -98,16 +130,35 @@ export interface QueueState {
   followUp: string[];
 }
 
+/** One pending queue item with its identity. Legacy rows (no queueId) get a
+ *  synthetic `q_legacy_<seq>` id and `legacy: true` — they are visible but
+ *  never auto-drained (they predate the claim-all contract). */
+export interface QueueEntry extends QueuedIdentity {
+  queueId: string;
+  content: string;
+  disposition: 'steering' | 'followup';
+  legacy?: boolean;
+}
+
 export interface OrchestratorState {
   sessionId: string;
   turns: Array<{ id: string; status: 'requested' | 'running' | 'completed' | 'failed' | 'aborted'; prompt: string }>;
   activeTurnId: string | null;
   queue: QueueState;
+  /** pending items in queue order (steering and follow-up interleaved as queued) */
+  entries: QueueEntry[];
   imported: boolean;
 }
 
 export function initialState(sessionId: string): OrchestratorState {
-  return { sessionId, turns: [], activeTurnId: null, queue: { steering: [], followUp: [] }, imported: false };
+  return { sessionId, turns: [], activeTurnId: null, queue: { steering: [], followUp: [] }, entries: [], imported: false };
+}
+
+/** queue.updated detail computed from entries (strings kept for legacy readers). */
+function snapshotOf(entries: QueueEntry[]): { steering: string[]; followUp: string[]; ids: { steering: string[]; followUp: string[] } } {
+  const st = entries.filter((e) => e.disposition === 'steering');
+  const fu = entries.filter((e) => e.disposition === 'followup');
+  return { steering: st.map((e) => e.content), followUp: fu.map((e) => e.content), ids: { steering: st.map((e) => e.queueId), followUp: fu.map((e) => e.queueId) } };
 }
 
 // ── The pure orchestrator: decide(state, command) → events ──
@@ -132,9 +183,19 @@ export function decide(state: OrchestratorState, cmd: TurnCommand): TurnEvent[] 
           { ...S(cmd.turnId), kind: 'queue.updated', detail: { ...state.queue, followUp: [...state.queue.followUp, cmd.prompt] } },
         ];
       }
+      // claim-all: the claimed items leave the queue in THIS decision. A claim
+      // that matches no pending item decides nothing (the drain lost a race —
+      // never start a turn for items someone else already took).
+      const claimed = cmd.claim ? state.entries.filter((e) => cmd.claim!.includes(e.queueId)) : [];
+      if (cmd.claim && cmd.claim.length > 0 && claimed.length === 0) return [];
+      const claimEvents: TurnEvent[] = claimed.length === 0 ? [] : [
+        ...claimed.map((e) => ({ ...S(cmd.turnId), kind: 'queue.removed' as const, detail: { queueId: e.queueId, reason: 'claimed' as const } })),
+        { ...S(cmd.turnId), kind: 'queue.updated', detail: snapshotOf(state.entries.filter((e) => !claimed.includes(e))) },
+      ];
       return [
+        ...claimEvents,
         { ...S(cmd.turnId), kind: 'turn.requested', detail: { prompt: cmd.prompt, refIds: cmd.refIds } },
-        { ...S(cmd.turnId), kind: 'user_message.recorded', detail: { role: 'user', content: cmd.prompt } },
+        { ...S(cmd.turnId), kind: 'user_message.recorded', detail: { role: 'user', content: cmd.display ?? cmd.prompt, ...(cmd.items !== undefined ? { items: cmd.items } : {}) } },
         { ...S(cmd.turnId), kind: 'turn.started', detail: {} },
       ];
     }
@@ -142,13 +203,55 @@ export function decide(state: OrchestratorState, cmd: TurnCommand): TurnEvent[] 
     case 'message.append':
       return [{ ...S(state.activeTurnId ?? ''), kind: 'user_message.recorded', detail: { role: cmd.role, content: cmd.content } }];
 
-    case 'message.queue':
+    case 'message.queue': {
+      const { kind: _k, sessionId: _s, content, disposition, ...identity } = cmd;
+      // duplicate-submit guard (second line of defence; the host route checks
+      // removed items too): a still-pending item with the same request id
+      // from the same principal decides nothing.
+      if (identity.requestId !== undefined && state.entries.some((e) => e.requestId === identity.requestId && e.principalId === identity.principalId)) return [];
+      if (identity.queueId === undefined) {
+        // legacy shape (no identity): unchanged string-snapshot behaviour
+        return [
+          { ...S(state.activeTurnId ?? ''), kind: 'message.queued', detail: { content, disposition } },
+          { ...S(state.activeTurnId ?? ''), kind: 'queue.updated', detail: disposition === 'steering'
+            ? { steering: [...state.queue.steering, content], followUp: state.queue.followUp }
+            : { steering: state.queue.steering, followUp: [...state.queue.followUp, content] } },
+        ];
+      }
+      const entry: QueueEntry = { ...identity, queueId: identity.queueId, content, disposition };
       return [
-        { ...S(state.activeTurnId ?? ''), kind: 'message.queued', detail: { content: cmd.content, disposition: cmd.disposition } },
-        { ...S(state.activeTurnId ?? ''), kind: 'queue.updated', detail: cmd.disposition === 'steering'
-          ? { steering: [...state.queue.steering, cmd.content], followUp: state.queue.followUp }
-          : { steering: state.queue.steering, followUp: [...state.queue.followUp, cmd.content] } },
+        { ...S(state.activeTurnId ?? ''), kind: 'message.queued', detail: { content, disposition, ...identity } },
+        { ...S(state.activeTurnId ?? ''), kind: 'queue.updated', detail: snapshotOf([...state.entries, entry]) },
       ];
+    }
+
+    case 'queue.remove': {
+      const hit = state.entries.find((e) => e.queueId === cmd.queueId);
+      if (!hit) return []; // unknown or already gone: idempotent no-op
+      return [
+        { ...S(state.activeTurnId ?? ''), kind: 'queue.removed', detail: { queueId: cmd.queueId, reason: cmd.reason } },
+        { ...S(state.activeTurnId ?? ''), kind: 'queue.updated', detail: snapshotOf(state.entries.filter((e) => e !== hit)) },
+      ];
+    }
+
+    case 'steer.deliver': {
+      const t = state.turns.find((x) => x.id === cmd.turnId);
+      if (!t || t.status !== 'running') return [];
+      const taken = state.entries.filter((e) => e.disposition === 'steering' && !e.legacy && cmd.queueIds.includes(e.queueId));
+      if (taken.length === 0) return [];
+      const items = taken.map((e) => ({ queueId: e.queueId, content: e.content }));
+      return [
+        ...taken.map((e) => ({ ...S(cmd.turnId), kind: 'queue.removed' as const, detail: { queueId: e.queueId, reason: 'delivered' as const } })),
+        { ...S(cmd.turnId), kind: 'queue.updated', detail: snapshotOf(state.entries.filter((e) => !taken.includes(e))) },
+        { ...S(cmd.turnId), kind: 'steer.delivered', detail: { items } },
+        // model memory: later turns rebuild history from user rows only — a
+        // delivered steer must be one, ordered before this turn's answer.
+        ...items.map((it) => ({ ...S(cmd.turnId), kind: 'user_message.recorded' as const, detail: { role: 'user' as const, content: it.content, via: 'steer' as const } })),
+      ];
+    }
+
+    case 'session.notice':
+      return [{ ...S(cmd.turnId ?? state.activeTurnId ?? ''), kind: 'session.notice', detail: { level: cmd.level, text: cmd.text } }];
 
     case 'turn.start': {
       const t = state.turns.find((x) => x.id === cmd.turnId);
@@ -215,7 +318,7 @@ export function decide(state: OrchestratorState, cmd: TurnCommand): TurnEvent[] 
 // ── Fold: events → next state (replay IS the fold; projections read the same fold) ──
 
 export function fold(state: OrchestratorState, e: TurnEvent): OrchestratorState {
-  const next: OrchestratorState = { ...state, turns: [...state.turns], queue: { ...state.queue } };
+  const next: OrchestratorState = { ...state, turns: [...state.turns], queue: { ...state.queue }, entries: [...(state.entries ?? [])] };
   switch (e.kind) {
     case 'session.imported':
       next.imported = true;
@@ -243,14 +346,40 @@ export function fold(state: OrchestratorState, e: TurnEvent): OrchestratorState 
       return next;
       }
     case 'message.queued': {
-      const d = e.detail as { content: string; disposition: 'steering' | 'followup' };
+      const d = e.detail as { content: string; disposition: 'steering' | 'followup' } & QueuedIdentity;
+      next.queue = { steering: [...next.queue.steering], followUp: [...next.queue.followUp] };
       if (d.disposition === 'steering') next.queue.steering.push(d.content);
       else next.queue.followUp.push(d.content);
+      next.entries.push(d.queueId !== undefined
+        ? { ...d, queueId: d.queueId }
+        : { queueId: `q_legacy_${e.seq}`, content: d.content, disposition: d.disposition, legacy: true });
+      return next;
+    }
+    case 'queue.removed': {
+      const d = e.detail as { queueId: string };
+      next.entries = next.entries.filter((x) => x.queueId !== d.queueId);
       return next;
     }
     case 'queue.updated': {
-      const d = e.detail as { steering: string[]; followUp: string[] };
+      const d = e.detail as { steering: string[]; followUp: string[]; ids?: { steering: string[]; followUp: string[] } };
       next.queue = { steering: [...d.steering], followUp: [...d.followUp] };
+      if (d.ids) {
+        const keep = new Set([...d.ids.steering, ...d.ids.followUp]);
+        next.entries = next.entries.filter((x) => keep.has(x.queueId));
+      } else {
+        // legacy snapshot: entries follow the strings; an existing entry with
+        // the same content/disposition keeps its identity, the rest are legacy
+        const pool = [...next.entries];
+        const take = (content: string, disposition: 'steering' | 'followup', i: number): QueueEntry => {
+          const at = pool.findIndex((x) => x.content === content && x.disposition === disposition);
+          if (at !== -1) return pool.splice(at, 1)[0]!;
+          return { queueId: `q_legacy_${e.seq}_${disposition}_${i}`, content, disposition, legacy: true };
+        };
+        next.entries = [
+          ...d.steering.map((c, i) => take(c, 'steering', i)),
+          ...d.followUp.map((c, i) => take(c, 'followup', i)),
+        ];
+      }
       return next;
     }
     default:

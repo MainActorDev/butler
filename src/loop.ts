@@ -99,6 +99,12 @@ export interface LoopDeps {
    *  replayed log can separate consecutive hops' narration instead of gluing
    *  it. Purely additive: absent → behavior identical to before. */
   onActivity?: (a: TextBlockActivity) => void;
+  /** steering seam: called once per hop AFTER the hop's tool results are
+   *  appended and BEFORE the next provider call. Each returned item rides
+   *  into the conversation as a user message. The caller owns durability
+   *  (it records the delivery before returning). A throw is ignored — the
+   *  items stay pending for the next turn. */
+  takeSteering?: () => Array<{ queueId: string; content: string }>;
   signal?: AbortSignal;
 }
 
@@ -266,6 +272,16 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
       messages.push(msg);
       deps.onMessage?.(msg, { hop, tokensIn: 0, tokensOut: 0 });
       deps.onEvent?.({ type: 'turn.tool', hop, detail: { phase: 'result', name: call.function.name, result: `${obs.length} bytes` } });
+    }
+    // tool boundary: steers sent while this hop ran join before the next call
+    if (deps.takeSteering && !deps.signal?.aborted) {
+      let steers: Array<{ queueId: string; content: string }> = [];
+      try { steers = deps.takeSteering(); } catch { steers = []; }
+      for (const s of steers) {
+        const msg: ProviderMessage = { role: 'user', content: s.content };
+        messages.push(msg);
+        deps.onMessage?.(msg, { hop, tokensIn: 0, tokensOut: 0 });
+      }
     }
   }
   throw new LoopError(`hop budget exhausted (${budget.maxHops})`, 'BUDGET_EXCEEDED', messages, 'budget-hop');
