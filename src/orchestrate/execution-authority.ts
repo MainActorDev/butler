@@ -26,7 +26,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import type { EventSink } from './event-sink.ts';
 import type { Storage } from '../memory/contract.ts';
-import type { TurnCommand, TurnEvent } from './turn-engine.ts';
+import type { NoticeLevel, QueueEntry, QueueItemRef, QueueRemovalReason, QueuedBody, TurnCommand, TurnEvent } from './turn-engine.ts';
 
 /** Thrown when another executor already holds the control lock for this
  *  agent DB. The caller must fail startup — never serve alongside it. */
@@ -69,6 +69,20 @@ export type StopResult =
   | { status: 'nonlocal' };
 
 export type RecoveryResult = { recovered: number; quarantined: boolean; uncertainWorkers: number };
+
+/** Prior use of a client request id on a session (duplicate-submit guard). */
+export type RequestLookup =
+  | { kind: 'turn'; turnId: string; sameContent: boolean }
+  | { kind: 'queued'; queueId: string; sameContent: boolean }
+  | null;
+
+export interface EnqueueInput {
+  content: string;
+  disposition: 'steering' | 'followup';
+  principalId: string;
+  requestId?: string;
+  body?: QueuedBody;
+}
 
 export interface ResolveWorkerInput {
   expectedEpoch: string;
@@ -154,6 +168,10 @@ export class ExecutionAuthority {
   private readonly active = new Map<string, ExecutionAttempt>();
   private readonly tracked = new Map<string, Promise<unknown>>();
   private released = false;
+  /** closing gate: set by beginShutdown() BEFORE the host aborts running
+   *  turns, so a turn settling during shutdown can never start new work */
+  private closing = false;
+  private readonly readyWaiters: Array<() => void> = [];
 
   constructor(
     readonly dbPath: string,
@@ -173,7 +191,7 @@ export class ExecutionAuthority {
   tryReserve(sessionId: string): ReserveResult {
     if (this.released) return { status: 'unavailable', reason: 'closed' };
     if (this.phase === 'quarantined') return { status: 'unavailable', reason: 'quarantined' };
-    if (this.phase === 'draining') return { status: 'unavailable', reason: 'draining' };
+    if (this.phase === 'draining' || this.closing) return { status: 'unavailable', reason: 'draining' };
     if (this.phase !== 'ready') return { status: 'unavailable', reason: 'recovering' };
     const local = this.active.get(sessionId);
     if (local) return { status: 'busy', turnId: local.turnId };
@@ -193,7 +211,7 @@ export class ExecutionAuthority {
   /** Durable atomic admission: turn.request events + projections + receipt +
    *  execution row in one commit; the intended turn.started must have landed.
    *  Releases the reservation on every non-admitted path. */
-  admit(attempt: ExecutionAttempt, input: { content: string; principalId: string; requestId?: string }): AdmissionResult {
+  admit(attempt: ExecutionAttempt, input: { content: string; principalId: string; requestId?: string; display?: string; items?: QueueItemRef[]; claim?: string[] }): AdmissionResult {
     if (!this.owns(attempt)) return { status: 'rejected', code: 'STALE_ATTEMPT' };
     const fp = requestFingerprint(input.content);
     const release = () => this.releaseAttempt(attempt);
@@ -215,7 +233,12 @@ export class ExecutionAuthority {
             throw new Reject('REQUEST_ID_REUSE', prior.turn_id);
           }
         }
-        const cmd: TurnCommand = { kind: 'turn.request', sessionId: attempt.sessionId, turnId: attempt.turnId, prompt: input.content, refIds: [], at: Date.now() } as TurnCommand;
+        const cmd: TurnCommand = {
+          kind: 'turn.request', sessionId: attempt.sessionId, turnId: attempt.turnId, prompt: input.content, refIds: [], at: Date.now(),
+          ...(input.display !== undefined ? { display: input.display } : {}),
+          ...(input.items !== undefined ? { items: input.items } : {}),
+          ...(input.claim !== undefined ? { claim: input.claim } : {}),
+        } as TurnCommand;
         const { events } = this.sink.handleInTransaction(attempt.sessionId, cmd, `chat:${attempt.sessionId}:${attempt.turnId}`, (txnDb) => {
           txnDb.prepare('INSERT INTO butler_executions(turn_id,session_id,epoch,principal_id,request_id,started_at,phase,stop_requested,request_hash) VALUES (?,?,?,?,?,?,?,0,?)')
             .run(attempt.turnId, attempt.sessionId, this.epoch, input.principalId, input.requestId ?? null, Date.now(), 'preparing', fp);
@@ -348,6 +371,95 @@ export class ExecutionAuthority {
     return { status: wroteTerminal ? 'finalized' : 'already-terminal', accounted };
   }
 
+  // ── queue (detached send / steer / claim-all drain) ──
+
+  /** Duplicate-submit guard, read BEFORE tryReserve: a client request id is
+   *  looked up in BOTH stores — admitted turns (ledger) and every queued
+   *  item of the session, pending or already claimed/deleted/delivered. */
+  lookupRequest(sessionId: string, principalId: string, requestId: string, content: string): RequestLookup {
+    const fp = requestFingerprint(content);
+    const turn = this.agent
+      .prepare('SELECT turn_id, request_hash FROM butler_executions WHERE principal_id = ? AND session_id = ? AND request_id = ?')
+      .get(principalId, sessionId, requestId) as { turn_id: string; request_hash: string | null } | undefined;
+    if (turn) return { kind: 'turn', turnId: turn.turn_id, sameContent: turn.request_hash === fp };
+    const queued = this.agent
+      .prepare("SELECT json_extract(detail_json,'$.queueId') AS qid, json_extract(detail_json,'$.fingerprint') AS fp FROM butler_turn_events WHERE session_id = ? AND kind = 'message.queued' AND json_extract(detail_json,'$.requestId') = ? AND json_extract(detail_json,'$.principalId') = ? ORDER BY seq LIMIT 1")
+      .get(sessionId, requestId, principalId) as { qid: string | null; fp: string | null } | undefined;
+    if (queued?.qid) return { kind: 'queued', queueId: queued.qid, sameContent: queued.fp === fp };
+    return null;
+  }
+
+  /** Durable enqueue with identity. Returns the item id (the existing one
+   *  when the engine refused a still-pending duplicate). */
+  enqueue(sessionId: string, input: EnqueueInput): { queueId: string; disposition: 'steering' | 'followup' } {
+    const queueId = `q_${randomUUID().slice(0, 12)}`;
+    this.sink.handle(sessionId, {
+      kind: 'message.queue', sessionId, content: input.content, disposition: input.disposition,
+      queueId, principalId: input.principalId, fingerprint: requestFingerprint(input.content),
+      ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+      ...(input.body !== undefined ? { body: input.body } : {}),
+    } as TurnCommand, `queue:${sessionId}:${queueId}`);
+    const entries = this.sink.state(sessionId).entries;
+    const mine = entries.find((e) => e.queueId === queueId)
+      ?? (input.requestId !== undefined ? entries.find((e) => e.requestId === input.requestId && e.principalId === input.principalId) : undefined);
+    return { queueId: mine?.queueId ?? queueId, disposition: mine?.disposition ?? input.disposition };
+  }
+
+  /** Remove one pending item; false when it is unknown or already gone. */
+  removeQueued(sessionId: string, queueId: string, reason: QueueRemovalReason = 'deleted'): boolean {
+    const { events } = this.sink.handle(sessionId, { kind: 'queue.remove', sessionId, queueId, reason } as TurnCommand, `queue:${sessionId}:${queueId}:remove`);
+    return events.length > 0;
+  }
+
+  /** Pending items that may run (legacy rows without identity never auto-run). */
+  pendingQueue(sessionId: string): QueueEntry[] {
+    return this.sink.state(sessionId).entries.filter((e) => !e.legacy);
+  }
+
+  /** Sessions holding identity-bearing pending items (boot drain input). */
+  sessionsWithPending(): string[] {
+    const rows = this.agent
+      .prepare("SELECT DISTINCT session_id FROM butler_turn_events WHERE kind = 'message.queued' AND json_extract(detail_json,'$.queueId') IS NOT NULL")
+      .all() as Array<{ session_id: string }>;
+    return rows.map((r) => r.session_id).filter((sid) => this.pendingQueue(sid).length > 0);
+  }
+
+  /** Steer delivery at a tool boundary, owner-fenced: every pending steering
+   *  item leaves the queue and is recorded as delivered (plus a user row for
+   *  model memory) in ONE commit; the items are returned for the loop. */
+  deliverSteering(attempt: ExecutionAttempt): QueueItemRef[] {
+    if (!this.owns(attempt)) return [];
+    const steers = this.pendingQueue(attempt.sessionId).filter((e) => e.disposition === 'steering');
+    if (steers.length === 0) return [];
+    const { events } = this.handleOwned(attempt, attempt.sessionId, {
+      kind: 'steer.deliver', sessionId: attempt.sessionId, turnId: attempt.turnId, queueIds: steers.map((e) => e.queueId),
+    } as TurnCommand, `steer:${attempt.turnId}:${steers.map((e) => e.queueId).join(',')}`);
+    const delivered = events.find((e) => e.kind === 'steer.delivered');
+    return delivered && delivered.kind === 'steer.delivered' ? delivered.detail.items : [];
+  }
+
+  /** Generic durable notice row (no host vocabulary). */
+  notice(sessionId: string, level: NoticeLevel, text: string, turnId?: string): void {
+    this.sink.handle(sessionId, { kind: 'session.notice', sessionId, level, text, ...(turnId !== undefined ? { turnId } : {}) } as TurnCommand, `notice:${sessionId}:${randomUUID()}`);
+  }
+
+  /** Closing gate. Call BEFORE aborting running turns at shutdown: from here
+   *  on nothing new is reserved (sends, drains), so a turn that settles
+   *  during shutdown cannot start the next queued work. Idempotent. */
+  beginShutdown(): void {
+    this.closing = true;
+  }
+
+  isClosing(): boolean {
+    return this.closing || this.released || this.phase === 'draining';
+  }
+
+  /** Run `cb` once the authority is ready (now, or when quarantine resolves). */
+  whenReady(cb: () => void): void {
+    if (this.phase === 'ready' && !this.closing) { cb(); return; }
+    this.readyWaiters.push(cb);
+  }
+
   /** Release the in-process reservation ONLY if the identity still matches. */
   releaseAttempt(attempt: ExecutionAttempt): void {
     if (this.active.get(attempt.sessionId) === attempt) this.active.delete(attempt.sessionId);
@@ -461,6 +573,7 @@ export class ExecutionAuthority {
    *  control lock. A drain problem keeps the lock held — never close anyway. */
   async drain(): Promise<void> {
     if (this.released) return;
+    this.closing = true;
     this.setPhase('draining');
     await Promise.allSettled([...this.tracked.values()]);
     this.setPhase('released');
@@ -490,5 +603,10 @@ export class ExecutionAuthority {
   private setPhase(phase: 'recovering' | 'ready' | 'draining' | 'quarantined' | 'released'): void {
     this.phase = phase;
     this.agent.prepare('UPDATE butler_execution_authority SET phase = ? WHERE singleton = 1').run(phase);
+    if (phase === 'ready' && !this.closing) {
+      for (const cb of this.readyWaiters.splice(0)) {
+        try { cb(); } catch { /* a waiter fault never blocks readiness */ }
+      }
+    }
   }
 }

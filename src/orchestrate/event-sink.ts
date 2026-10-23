@@ -76,8 +76,43 @@ export type Effect =
   | { type: 'runTurn'; sessionId: string; turnId: string }
   | { type: 'emit'; event: TurnEvent };
 
+/** Push-on-append listener: rows of ONE session, in seq order, delivered only
+ *  after the outermost transaction that wrote them has committed. */
+export type AppendListener = (sessionId: string, rows: TurnEvent[]) => void;
+
 export class EventSink {
   private states = new Map<string, OrchestratorState>();
+  private readonly listeners = new Set<AppendListener>();
+  /** rows committed by an inner write whose OUTER transaction is still open */
+  private pending: TurnEvent[] = [];
+
+  /** Subscribe to committed appends. Process-local: rows written by another
+   *  process (or by direct inserts outside the sink, e.g. recoverOrphans at
+   *  construction) are never pushed — readers keep a catch-up read for those.
+   *  A throwing listener is isolated (never affects the write or others). */
+  onAppend(listener: AppendListener): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  /** Deliver buffered rows once no transaction is open on the connection. */
+  private flush(): void {
+    if (this.db.inTransaction || this.pending.length === 0) return;
+    const rows = this.pending;
+    this.pending = [];
+    if (this.listeners.size === 0) return;
+    const bySession = new Map<string, TurnEvent[]>();
+    for (const r of rows) {
+      const list = bySession.get(r.session_id);
+      if (list) list.push(r);
+      else bySession.set(r.session_id, [r]);
+    }
+    for (const [sessionId, list] of bySession) {
+      for (const l of this.listeners) {
+        try { l(sessionId, list); } catch { /* listener faults never reach the writer */ }
+      }
+    }
+  }
 
   constructor(private readonly db: Database.Database, opts?: { enqueueRunTurn?: boolean; passive?: boolean }) {
     db.exec(DDL);
@@ -172,7 +207,17 @@ export class EventSink {
    *  connections to one file must never nest transactions. */
   withTransaction<T>(fn: (db: Database.Database) => T): T {
     const run = this.db.transaction(() => fn(this.db));
-    return run();
+    const mark = this.pending.length;
+    let out: T;
+    try {
+      out = run();
+    } catch (err) {
+      // rolled back (outer txn or savepoint): its rows were never committed
+      this.pending.length = mark;
+      throw err;
+    }
+    this.flush();
+    return out;
   }
 
   /** One consistent snapshot: folded state + events + lastSeq from the same
@@ -232,6 +277,10 @@ export class EventSink {
       this.states.delete(sessionId);
       throw err;
     }
+    // push-on-append: buffered, flushed now when this was the outermost
+    // transaction, else when the enclosing withTransaction commits
+    this.pending.push(...appended);
+    this.flush();
     // outbox rows AFTER the txn commits (the effect worker owns retirement)
     if (this.enqueueRunTurn) {
       for (const eff of effects) {

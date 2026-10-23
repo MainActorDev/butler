@@ -69,6 +69,9 @@ export interface ConversationDeps {
    *  reports the common execution snapshot. When unset, the legacy
    *  process-local reservation applies (single-instance deployments only). */
   execution?: ExecutionAuthority;
+  /** detached turns: waits (ms) between finalization retries when the
+   *  terminal write fails (default 1s, 5s, 30s). Tests shorten it. */
+  finalizeRetryMs?: number[];
 }
 
 export interface TurnOutcome {
@@ -167,51 +170,52 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     return { session: row, messages: await storage.sessionMessages(id), ...(liveTurn ? { liveTurn } : {}) };
   });
 
-  app.post('/api/agent/sessions/:id/messages', async (req, reply) => {
-    const { id } = req.params as { id: string };
-    const b = (req.body ?? {}) as { content?: string; commands?: string[]; model?: string; clientRequestId?: string };
-    if (!b.content?.trim()) return reply.code(400).send({ error: 'content required' });
-    const session = await storage.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'session not found' });
-    const content = b.content; // narrowed string (validated above) — safe in closures
+  /** One admitted (or legacy-reserved) turn, from preparation to settlement.
+   *  Shared by the held POST (awaits it), the detached POST and the queue
+   *  drain (both run it as a tracked worker). Returns the HTTP envelope the
+   *  held route sends; detached callers only log non-2xx results. */
+  interface AdmittedRun {
+    id: string;
+    b: { content?: string; commands?: string[]; model?: string };
+    content: string;
+    session: NonNullable<Awaited<ReturnType<Storage['getSession']>>>;
+    ownedAttempt: ExecutionAttempt | null;
+    ac: AbortController;
+    durableTurnId: string;
+    /** no client waits on this turn: finalization retries itself */
+    detached: boolean;
+    /** held route only: client-disconnect hook (#7) */
+    reply?: { raw: { on(ev: 'close', cb: () => void): unknown; writableEnded: boolean } };
+  }
+  type RunResult = { code: number; payload: unknown };
+
+  const runAdmittedTurn = async (run: AdmittedRun): Promise<RunResult> => {
+    const { id, b, content, session, ownedAttempt, ac, durableTurnId, detached } = run;
     const exec = deps.execution ?? null;
-    // F1 (chat-reliability): check-and-acquire is atomic — no await between
-    // check and acquire — and the reservation precedes every durable write,
-    // history/stash preparation and host hook. Every exit path below releases
-    // it; the admission race loser gets 409 BEFORE any side effect.
-    let ac: AbortController;
-    let durableTurnId: string;
-    let ownedAttempt: ExecutionAttempt | null = null;
-    if (exec) {
-      // authority-driven admission: cross-process atomic via the control-DB
-      // election + one-transaction durable admission (events + receipt +
-      // ledger row land together; the intended turn.started is required).
-      const res = exec.tryReserve(id);
-      if (res.status === 'busy') return reply.code(409).send({ error: 'turn already in flight on this session', ...(res.turnId !== undefined ? { turnId: res.turnId } : {}) });
-      if (res.status === 'unavailable') return reply.code(503).send({ error: `chat execution unavailable (${res.reason}) — try again later`, code: res.reason });
-      const attempt = res.attempt;
-      const adm = exec.admit(attempt, { content, principalId: session.user_id ?? 'anonymous', ...(b.clientRequestId !== undefined ? { requestId: b.clientRequestId } : {}) });
-      if (adm.status !== 'admitted') {
-        if (adm.code === 'REQUEST_ALREADY_ADMITTED') return reply.code(409).send({ error: 'request already admitted', code: adm.code, ...(adm.turnId !== undefined ? { turnId: adm.turnId } : {}) });
-        if (adm.code === 'REQUEST_ID_REUSE') return reply.code(409).send({ error: 'client request id was already used with different content', code: adm.code });
-        if (adm.code === 'SESSION_ACTIVE') return reply.code(409).send({ error: 'turn already in flight on this session', code: adm.code });
-        if (adm.code === 'QUEUE_DECISION') return reply.code(409).send({ error: 'session is resolving prior work — resend to run as the next turn', code: adm.code });
-        return reply.code(500).send({ error: `admission failed: ${adm.message ?? adm.code}`, code: adm.code });
-      }
-      ownedAttempt = attempt;
-      ac = attempt.controller;
-      durableTurnId = attempt.turnId;
-    } else {
-      if (activeTurns.has(id)) return reply.code(409).send({ error: 'turn already in flight on this session' });
-      ac = new AbortController();
-      activeTurns.set(id, ac);
-      durableTurnId = `t_${crypto.randomUUID().slice(0, 12)}`;
-    }
     // durable-write seam: authority path fences every command by the owned
     // attempt; local path writes through the sink directly.
     const durable = (cmd: TurnCommand, key: string): void => {
       if (exec && ownedAttempt) exec.handleOwned(ownedAttempt, id, cmd, key);
       else if (deps.sink) deps.sink.handle(id, cmd, key);
+    };
+    // detached finalization: no client will retry a FINALIZATION_PENDING, so
+    // the worker retries the idempotent finalize itself (bounded backoff),
+    // stops at shutdown (the attempt stays reserved for boot recovery), and
+    // leaves a durable notice when every try failed.
+    const finalize = async (attempt: ExecutionAttempt, input: Parameters<ExecutionAuthority['finalizeOwned']>[1]) => {
+      if (!exec) throw new Error('no execution authority');
+      if (!detached) return exec.finalizeOwned(attempt, input);
+      const waits = deps.finalizeRetryMs ?? [1_000, 5_000, 30_000];
+      let lastErr: unknown;
+      for (let i = 0; ; i++) {
+        try { return await exec.finalizeOwned(attempt, input); } catch (err) { lastErr = err; }
+        if (i >= waits.length || exec.isClosing()) break;
+        const until = Date.now() + waits[i]!;
+        while (Date.now() < until && !exec.isClosing()) await new Promise((r) => setTimeout(r, Math.min(50, until - Date.now())));
+        if (exec.isClosing()) break;
+      }
+      try { exec.notice(id, 'error', `the turn could not be saved as finished (${lastErr instanceof Error ? lastErr.message : String(lastErr)}) — it stays reserved until recovery`, durableTurnId); } catch { /* storage is what failed */ }
+      throw lastErr;
     };
     // chat-reliability F2 (text block lifecycle): durable block metadata for
     // the chunk rail, derived from the loop's block tracker (onActivity).
@@ -233,8 +237,8 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           }
         },
         blockFor: (hop: number): { id: string; phase: 'delta'; native?: string } | undefined => {
-          const b = byHop.get(hop);
-          return b ? { id: b.id, phase: 'delta' as const, ...(b.native !== undefined ? { native: b.native } : {}) } : undefined;
+          const blk = byHop.get(hop);
+          return blk ? { id: blk.id, phase: 'delta' as const, ...(blk.native !== undefined ? { native: blk.native } : {}) } : undefined;
         },
       };
     };
@@ -259,11 +263,11 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       const noActive = st.activeTurnId === null;
       if (queuedIdx !== -1 && noActive) {
         // drain: this request IS the queued message → run as the next turn
-        deps.sink.handle(id, { kind: 'message.queue', sessionId: id, content: b.content, disposition: 'steering' }, `chat:${id}:${durableTurnId}:dequeue`);
+        deps.sink.handle(id, { kind: 'message.queue', sessionId: id, content, disposition: 'steering' }, `chat:${id}:${durableTurnId}:dequeue`);
       }
       deps.sink.handle(id, { kind: 'turn.request', sessionId: id, turnId: durableTurnId, prompt: content, refIds: [], at: Date.now() }, `chat:${id}:${durableTurnId}`);
     } else {
-      await storage.appendMessage({ session_id: id, role: 'user', content: b.content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
+      await storage.appendMessage({ session_id: id, role: 'user', content, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
     }
 
     // resume context from rows alone (condition 4)
@@ -293,7 +297,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       // must never strand the session reservation.
       if (exec && ownedAttempt) exec.releaseAttempt(ownedAttempt);
       else activeTurns.delete(id);
-      return reply.code(500).send({ error: `turn preparation failed: ${prepErr instanceof Error ? prepErr.message : String(prepErr)}` });
+      return { code: 500, payload: { error: `turn preparation failed: ${prepErr instanceof Error ? prepErr.message : String(prepErr)}` } };
     }
     const outcome: TurnOutcome = { sessionId: id, ok: false, tokens: { in: 0, out: 0 }, hops: 0 };
     // ownership liveness flag: the disconnect hook may abort only while THIS
@@ -319,9 +323,11 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
     // (not socket death); reply.raw 'close' with !writableEnded = the client
     // vanished before the answer was flushed. The liveness guard makes
     // the normal post-response close (which fires after release) a no-op.
-    if (deps.abortOnDisconnect) {
-      reply.raw.on('close', () => {
-        if (!reply.raw.writableEnded && ownsLiveTurn) ac.abort();
+    // Detached turns have no waiting client — never wired.
+    if (deps.abortOnDisconnect && run.reply) {
+      const raw = run.reply.raw;
+      raw.on('close', () => {
+        if (!raw.writableEnded && ownsLiveTurn) ac.abort();
       });
     }
     try {
@@ -352,8 +358,8 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
       const sink = deps.sink; // durable path: chunks/tools/usage/completion ride commands
       // commands-as-chat-turns: overlay composes AFTER the base (host's block
       // already carries command bodies only — no double base, review CR1)
-      const overlay = Array.isArray((b as { commands?: string[] }).commands) && deps.commandOverlay
-        ? deps.commandOverlay(((b as { commands?: string[] }).commands ?? []).filter((c): c is string => typeof c === 'string'))
+      const overlay = Array.isArray(b.commands) && deps.commandOverlay
+        ? deps.commandOverlay((b.commands ?? []).filter((c): c is string => typeof c === 'string'))
         : null;
       const cmdBlock = overlay ? overlay.promptBlock : '';
       const allowedTools = registry.list().filter((t) => permissionRank(policy.allows) >= permissionRank(t.permission));
@@ -362,12 +368,12 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         : allowedTools;
       // model routing (PR2): the host resolved a model/combo for THIS body —
       // run the loop against the router's route-aware complete
-      const routedModel = deps.resolveModel?.(b as { content?: string; commands?: string[]; model?: string }) ?? undefined;
+      const routedModel = deps.resolveModel?.(b) ?? undefined;
       const routedComplete = routedModel !== undefined && deps.routeComplete ? deps.routeComplete(routedModel) : undefined;
       // v0.6.2: host decoration last — an editor-turn provider (cwd=worktree)
       // overrides routing; the block rides AFTER the command overlay
       let prep: { promptBlock?: string; provider?: Provider } | null = null;
-      try { prep = await deps.prepareTurn?.(id, b as { content: string; commands?: string[] }) ?? null; }
+      try { prep = await deps.prepareTurn?.(id, { ...b, content }) ?? null; }
       catch { prep = null; } // decoration failure must never kill the turn
       const turnProvider = prep?.provider ?? (routedComplete ? { complete: (m, t, o) => routedComplete(m, t, o), model: routedModel ?? deps.provider.model } : deps.provider);
       // AUTHORITY execution boundary: snapshot + CAS-consume the continuation
@@ -382,7 +388,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           outcome.error = 'aborted before start — no provider ran';
           outcome.code = 'ABORTED';
           await storage.updateSession(id, { status: 'active' });
-          return { turn: outcome };
+          return { code: 200, payload: { turn: outcome } };
         }
         const begunSeeded = (begun as { seeded: unknown[] | null }).seeded;
         if (begunSeeded && begunSeeded.length) {
@@ -391,89 +397,73 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         }
       }
       const blocks = blockRail();
+      // B5: a tool event with no invocation id gets a per-turn COUNTER id —
+      // never the bare tool name (repeated same-name calls stay distinct);
+      // a result pairs FIFO with the oldest open call of the same name.
+      let fallbackSeq = 0;
+      const openByName = new Map<string, string[]>();
+      const toolCallIdFor = (t: { phase: 'call' | 'result'; name: string; invocationId?: string }): string => {
+        if (t.invocationId !== undefined) return `tc_${durableTurnId}_i_${t.invocationId}`;
+        const open = openByName.get(t.name) ?? [];
+        if (t.phase === 'result') {
+          const paired = open.shift();
+          if (paired !== undefined) return paired;
+        }
+        const fresh = `tc_${durableTurnId}_n${fallbackSeq++}`;
+        if (t.phase === 'call') { open.push(fresh); openByName.set(t.name, open); }
+        return fresh;
+      };
+      const loopDeps: Parameters<typeof runLoop>[2] = {
+        sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
+        // prior turns only — the current message rides as userMessage; a
+        // stashed partial (if any) rides FIRST: it is the most recent context
+        history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
+        provider: turnProvider,
+        tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
+        ...(deps.budget ? { budget: deps.budget } : {}),
+        signal: ac.signal,
+        // rev10: live token stream → transport events (WS bridge streams UI)
+        ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
+        // steering seam: queued steers join at each tool boundary; the
+        // authority records the delivery (owned, one commit) before handing
+        // the items over
+        ...(exec && ownedAttempt ? { takeSteering: () => exec.deliverSteering(ownedAttempt) } : {}),
+        onMessage: (msg, meta) => {
+          if (!sink) void storage.appendMessage({
+            session_id: id, role: msg.role, content: msg.content,
+            tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
+            tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
+          });
+        },
+        onTool: (t) => {
+          // R3 fix: tool calls are durable entities too — the rail correlates by
+          // toolCallId, and the replay log must show HOW an answer was derived.
+          // chat-reliability F1: identity is per INVOCATION (provider-native
+          // call id) — repeated same-name invocations are distinct durable
+          // calls; events with no native id get a per-turn counter id (B5).
+          if (!sink && !exec) return;
+          const stable = toolCallIdFor(t);
+          if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
+          else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
+        },
+        // F2: block start/end ride their own chunk commands; per-delta
+        // chunks pick up block identity in the onEvent chunk handler.
+        onActivity: blocks.onActivity,
+        onEvent: (e) => {
+          deps.emit({ ...e, sessionId: id });
+          if (sink || exec) {
+            if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta), ...(blocks.blockFor(e.hop) ? { block: blocks.blockFor(e.hop) } : {}) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
+            if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
+              const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
+              if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
+            }
+          }
+        },
+      };
+      const systemPrompt = deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote;
       const result = await (exec && ownedAttempt
-        ? exec.trackWorker({ turnId: durableTurnId, identity: { seam: 'provider' } }, 'provider', () => runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, content, {
-            sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
-            // prior turns only — the current message rides as userMessage; a
-            // stashed partial (if any) rides FIRST: it is the most recent context
-            history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
-            provider: turnProvider,
-            tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
-            ...(deps.budget ? { budget: deps.budget } : {}),
-            signal: ac.signal,
-            // rev10: live token stream → transport events (WS bridge streams UI)
-            ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
-            onMessage: (msg, meta) => {
-              if (!sink) void storage.appendMessage({
-                session_id: id, role: msg.role, content: msg.content,
-                tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
-                tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
-              });
-            },
-            onTool: (t) => {
-              // R3 fix: tool calls are durable entities too — the rail correlates by
-              // toolCallId, and the replay log must show HOW an answer was derived.
-              // chat-reliability F1: identity is per INVOCATION (provider-native
-              // call id) — repeated same-name invocations are distinct durable
-              // calls; the name-derived id remains only for legacy harness events
-              // that carry no native id.
-              if (!sink && !exec) return;
-              const stable = t.invocationId !== undefined ? `tc_${durableTurnId}_i_${t.invocationId}` : `tc_${durableTurnId}_${t.name}`;
-              if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
-              else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
-            },
-            // F2: block start/end ride their own chunk commands; per-delta
-            // chunks pick up block identity in the onEvent chunk handler.
-            onActivity: blocks.onActivity,
-            onEvent: (e) => {
-              deps.emit({ ...e, sessionId: id });
-              if (sink || exec) {
-                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta), ...(blocks.blockFor(e.hop) ? { block: blocks.blockFor(e.hop) } : {}) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
-                if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
-                  const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
-                  if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
-                }
-              }
-            },
-          })) as unknown as Awaited<ReturnType<typeof runLoop>>
-        : runLoop(deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote, content, {
-            sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
-            // prior turns only — the current message rides as userMessage; a
-            // stashed partial (if any) rides FIRST: it is the most recent context
-            history: [...seeded, ...(history.length > 1 ? history.slice(-40, -1) : [])],
-            provider: turnProvider,
-            tools: toolSet.map((t) => toolFromRegistry(t.name, registry, policy, { sessionId: id })),
-            ...(deps.budget ? { budget: deps.budget } : {}),
-            signal: ac.signal,
-            // rev10: live token stream → transport events (WS bridge streams UI)
-            ...(deps.onDelta ? { onDelta: deps.onDelta(id) } : {}),
-            onMessage: (msg, meta) => {
-              if (!sink) void storage.appendMessage({
-                session_id: id, role: msg.role, content: msg.content,
-                tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
-                tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
-              });
-            },
-            onTool: (t) => {
-              if (!sink && !exec) return;
-              const stable = t.invocationId !== undefined ? `tc_${durableTurnId}_i_${t.invocationId}` : `tc_${durableTurnId}_${t.name}`;
-              if (t.phase === 'call') durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'call', toolCallId: stable, name: t.name, ...(t.arg !== undefined ? { arg: t.arg } : {}) } as TurnCommand, `chat:${durableTurnId}:tc:${stable}`);
-              else durable({ kind: 'turn.tool', sessionId: id, turnId: durableTurnId, phase: 'update', toolCallId: stable, ...(t.result !== undefined ? { result: t.result } : {}), ...(t.isError !== undefined ? { isError: t.isError } : {}) } as TurnCommand, `chat:${durableTurnId}:tu:${stable}:${Math.random()}`);
-            },
-            // F2: block start/end ride their own chunk commands; per-delta
-            // chunks pick up block identity in the onEvent chunk handler.
-            onActivity: blocks.onActivity,
-            onEvent: (e) => {
-              deps.emit({ ...e, sessionId: id });
-              if (sink || exec) {
-                if (e.type === 'turn.delta' && e.detail && typeof e.detail === 'object' && 'delta' in e.detail) durable({ kind: 'turn.chunk', sessionId: id, turnId: durableTurnId, delta: String((e.detail as { delta: unknown }).delta), ...(blocks.blockFor(e.hop) ? { block: blocks.blockFor(e.hop) } : {}) } as TurnCommand, `chat:${durableTurnId}:d:${Math.random()}`);
-                if (e.type === 'provider.response' && e.detail && typeof e.detail === 'object' && 'tokens' in e.detail) {
-                  const t = (e.detail as { tokens?: { promptTokens?: number; completionTokens?: number } }).tokens;
-                  if (t) durable({ kind: 'turn.usage', sessionId: id, turnId: durableTurnId, meters: { cost: (t.promptTokens ?? 0) + (t.completionTokens ?? 0), contextUsed: t.promptTokens ?? 0, contextWindow: deps.contextWindow ?? 200_000 } } as TurnCommand, `chat:${durableTurnId}:u:${Math.random()}`);
-                }
-              }
-            },
-          }));
+        ? exec.trackWorker({ turnId: durableTurnId, identity: { seam: 'provider' } }, 'provider', () => runLoop(systemPrompt, content, loopDeps)) as unknown as Awaited<ReturnType<typeof runLoop>>
+        : runLoop(systemPrompt, content, loopDeps));
       // v0.5.4: an EMPTY answer after real work is not success. A turn that
       // streamed narration or called tools and still ends with "" burned its
       // context (the 05:46 incident: 1M tokens, 40 tool calls, answer "") —
@@ -486,7 +476,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         outcome.ok = false;
         outcome.error = 'empty answer after work — turn failed honestly (see event log)';
         if (exec && ownedAttempt) {
-          await exec.finalizeOwned(ownedAttempt, {
+          await finalize(ownedAttempt, {
             kind: 'turn.fail',
             error: 'turn ended with an empty answer after processing (likely context exhaustion mid-run) — partial transcript preserved in the event log; resend to continue',
             commandKey: `chat:${durableTurnId}:emptyfail`,
@@ -499,7 +489,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           await storage.updateSession(id, { status: 'error' });
           await releaseOwnership('EMPTY_AFTER_WORK');
         }
-        return { turn: outcome };
+        return { code: 200, payload: { turn: outcome } };
       }
       outcome.ok = true;
       outcome.answer = result.answer;
@@ -509,13 +499,22 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         // §3.5 owned ATOMIC finalization: terminal event + projections + token
         // accounting + ledger settle commit together; the envelope reports
         // success only for a committed terminal.
-        const fin = await exec.finalizeOwned(ownedAttempt, {
-          kind: 'turn.complete',
-          answer: result.answer,
-          commandKey: `chat:${durableTurnId}:done`,
-          settleCode: 'COMPLETED',
-          accounting: { status: 'active', tokensInDelta: result.tokens.in, tokensOutDelta: result.tokens.out },
-        });
+        let fin: Awaited<ReturnType<ExecutionAuthority['finalizeOwned']>>;
+        try {
+          fin = await finalize(ownedAttempt, {
+            kind: 'turn.complete',
+            answer: result.answer,
+            commandKey: `chat:${durableTurnId}:done`,
+            settleCode: 'COMPLETED',
+            accounting: { status: 'active', tokensInDelta: result.tokens.in, tokensOutDelta: result.tokens.out },
+          });
+        } catch (finErr) {
+          // held: today's path (the catch below records a failure terminal);
+          // detached: the retries are spent and a notice is recorded — do
+          // not run a second retry series for the failure terminal
+          if (!detached) throw finErr;
+          return { code: 503, payload: { error: `finalization storage failure — outcome pending: ${finErr instanceof Error ? finErr.message : String(finErr)}`, code: 'FINALIZATION_PENDING' } };
+        }
         ownsLiveTurn = false;
         if (!fin.accounted) await storage.updateSession(id, { status: 'active', tokens_in: session.tokens_in + result.tokens.in, tokens_out: session.tokens_out + result.tokens.out });
       } else {
@@ -524,7 +523,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         await releaseOwnership('COMPLETED');
       }
       invokeAfterTurn(true, result.answer);
-      return { turn: outcome };
+      return { code: 200, payload: { turn: outcome } };
     } catch (err) {
       const e = err as { code?: string; message?: string };
       // no-hassle resume (2026-10-21 plan): budget exhaustion is a PAUSE, not
@@ -548,7 +547,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         // leaves the attempt reserved for an idempotent retry and reports
         // outcome-pending — never a false success.
         try {
-          const fin = await exec.finalizeOwned(ownedAttempt, {
+          const fin = await finalize(ownedAttempt, {
             kind: 'turn.fail',
             error: outcome.error,
             commandKey: `chat:${durableTurnId}:fail`,
@@ -559,7 +558,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           ownsLiveTurn = false;
           if (!fin.accounted) await storage.updateSession(id, { status: budgetExhausted ? 'active' : 'error' });
         } catch (finErr) {
-          return reply.code(503).send({ error: `finalization storage failure — outcome pending, the turn stays reserved for idempotent retry: ${finErr instanceof Error ? finErr.message : String(finErr)}`, code: 'FINALIZATION_PENDING' });
+          return { code: 503, payload: { error: `finalization storage failure — outcome pending, the turn stays reserved for idempotent retry: ${finErr instanceof Error ? finErr.message : String(finErr)}`, code: 'FINALIZATION_PENDING' } };
         }
       } else {
         if (deps.sink || exec) durable({ kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error } as TurnCommand, `chat:${durableTurnId}:fail`);
@@ -567,8 +566,171 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         await releaseOwnership(budgetExhausted ? 'BUDGET_EXCEEDED' : (e.code ?? 'FAILED'));
       }
       invokeAfterTurn(false, '');
-      return { turn: outcome }; // the turn failed; the REQUEST succeeded — outcome carries the verdict
+      return { code: 200, payload: { turn: outcome } }; // the turn failed; the REQUEST succeeded — outcome carries the verdict
     }
+  };
+
+  // ── detached turns + the claim-all queue drain (authority path only) ──
+
+  /** queue ids claimed by a turn this process admitted (runaway guard) */
+  const claimedOnce = new Set<string>();
+
+  /** Claim EVERY pending item (steers first, then follow-ups) into one turn
+   *  with the reserved attempt. The claim, the user row (display text +
+   *  items) and turn.started commit together inside admit(). Returns null
+   *  (attempt released) when nothing could be claimed. Synchronous: no await
+   *  between reservation and admission. */
+  const admitClaimAll = (attempt: ExecutionAttempt, sid: string, fallbackPrincipal: string): { content: string; body: { content: string; commands?: string[]; model?: string } } | null => {
+    const exec = deps.execution!;
+    const pending = exec.pendingQueue(sid);
+    const ordered = [...pending.filter((e) => e.disposition === 'steering'), ...pending.filter((e) => e.disposition === 'followup')];
+    if (ordered.length === 0) { exec.releaseAttempt(attempt); return null; }
+    const content = ordered.length === 1
+      ? ordered[0]!.content
+      : `[${ordered.length} queued messages]\n\n${ordered.map((e) => e.content.trim()).join('\n\n')}`;
+    const display = ordered.map((e) => e.content).join('\n\n');
+    const carrier = ordered.find((e) => e.body?.commands?.length || e.body?.model !== undefined)?.body;
+    // runaway guard: an item this process already claimed must never be
+    // claimed again (a claim that failed to remove its items would otherwise
+    // re-run them after every turn — an endless chain of model calls)
+    const repeat = ordered.find((e) => claimedOnce.has(e.queueId));
+    if (repeat) {
+      exec.releaseAttempt(attempt);
+      app.log?.warn?.(`queue drain refused on ${sid}: item ${repeat.queueId} was already claimed by an earlier turn`);
+      return null;
+    }
+    const adm = exec.admit(attempt, {
+      content, principalId: ordered[0]!.principalId ?? fallbackPrincipal, display,
+      items: ordered.map((e) => ({ queueId: e.queueId, content: e.content })),
+      claim: ordered.map((e) => e.queueId),
+    });
+    if (adm.status !== 'admitted') return null; // admit released the attempt
+    for (const e of ordered) claimedOnce.add(e.queueId);
+    return { content, body: { content, ...(carrier?.commands ? { commands: carrier.commands } : {}), ...(carrier?.model !== undefined ? { model: carrier.model } : {}) } };
+  };
+
+  /** Start an admitted turn as a tracked worker; when it settles the session
+   *  drains again (claim-all), so queued work never strands. */
+  const launchDetached = (run: Omit<AdmittedRun, 'detached' | 'reply'>): void => {
+    const exec = deps.execution!;
+    void exec.trackWorker({ turnId: run.durableTurnId, identity: { seam: 'detached' } }, 'detached', async () => {
+      const r = await runAdmittedTurn({ ...run, detached: true });
+      if (r.code >= 400) app.log?.warn?.(`detached turn ${run.durableTurnId} on ${run.id} ended with ${r.code}: ${JSON.stringify(r.payload)}`);
+      await drainSession(run.id);
+    }).catch(() => undefined);
+  };
+
+  /** Post-turn and boot drain: when items are pending and the session is
+   *  free, claim them all into one detached turn. No-op when closing, busy or
+   *  empty. Held and detached turns both end here (review U3). */
+  const drainSession = async (sid: string): Promise<void> => {
+    const exec = deps.execution;
+    if (!exec || exec.isClosing()) return;
+    if (exec.pendingQueue(sid).length === 0) return;
+    const session = await storage.getSession(sid);
+    if (!session) return;
+    // await-free from reservation to admission
+    const res = exec.tryReserve(sid);
+    if (res.status !== 'reserved') return;
+    const claimed = admitClaimAll(res.attempt, sid, session.user_id ?? 'anonymous');
+    if (!claimed) return;
+    launchDetached({ id: sid, b: claimed.body, content: claimed.content, session, ownedAttempt: res.attempt, ac: res.attempt.controller, durableTurnId: res.attempt.turnId });
+  };
+
+  // boot drain: items left pending by a previous process run once the
+  // authority is ready (never during recovery/quarantine or after shutdown)
+  if (deps.execution) {
+    const exec = deps.execution;
+    exec.whenReady(() => { for (const sid of exec.sessionsWithPending()) void drainSession(sid); });
+  }
+
+  // remove one pending queue item (the composer's chip ×)
+  app.delete('/api/agent/sessions/:id/queue/:queueId', async (req, reply) => {
+    const { id, queueId } = req.params as { id: string; queueId: string };
+    if (!deps.execution) return reply.code(400).send({ error: 'queue management requires an execution authority', code: 'DETACH_UNSUPPORTED' });
+    if (!deps.execution.removeQueued(id, queueId, 'deleted')) return reply.code(404).send({ error: 'queue item not found' });
+    return { removed: queueId };
+  });
+
+  app.post('/api/agent/sessions/:id/messages', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const b = (req.body ?? {}) as { content?: string; commands?: string[]; model?: string; clientRequestId?: string; detach?: boolean; mode?: 'steer' | 'queue' };
+    if (!b.content?.trim()) return reply.code(400).send({ error: 'content required' });
+    if (b.mode !== undefined && b.mode !== 'steer' && b.mode !== 'queue') return reply.code(400).send({ error: "mode must be 'steer' or 'queue'" });
+    const detach = b.detach === true;
+    if (detach && !deps.execution) return reply.code(400).send({ error: 'detached send requires an execution authority', code: 'DETACH_UNSUPPORTED' });
+    const session = await storage.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'session not found' });
+    const content = b.content; // narrowed string (validated above) — safe in closures
+    const exec = deps.execution ?? null;
+    const principalId = session.user_id ?? 'anonymous';
+    const queuedBody = { ...(b.commands?.length ? { commands: b.commands } : {}), ...(b.model !== undefined ? { model: b.model } : {}) };
+    // F1 (chat-reliability): check-and-acquire is atomic — no await between
+    // check and acquire — and the reservation precedes every durable write,
+    // history/stash preparation and host hook. Every exit path below releases
+    // it; the admission race loser gets 409 BEFORE any side effect.
+    if (exec) {
+      // detached duplicate-submit guard (reviews T3/U2/V1), inside the
+      // await-free window: one lookup across admitted turns AND every queued
+      // item (pending or gone). A hit writes nothing.
+      if (detach && b.clientRequestId !== undefined) {
+        const prior = exec.lookupRequest(id, principalId, b.clientRequestId, content);
+        if (prior && !prior.sameContent) return reply.code(409).send({ error: 'client request id was already used with different content', code: 'REQUEST_ID_REUSE' });
+        if (prior?.kind === 'turn') return reply.code(202).send({ startedTurnId: prior.turnId });
+        if (prior?.kind === 'queued') return reply.code(202).send({ queued: { queueId: prior.queueId } });
+      }
+      // authority-driven admission: cross-process atomic via the control-DB
+      // election + one-transaction durable admission (events + receipt +
+      // ledger row land together; the intended turn.started is required).
+      const res = exec.tryReserve(id);
+      if (res.status === 'unavailable') return reply.code(503).send({ error: `chat execution unavailable (${res.reason}) — try again later`, code: res.reason });
+      if (res.status === 'busy') {
+        if (!detach) return reply.code(409).send({ error: 'turn already in flight on this session', ...(res.turnId !== undefined ? { turnId: res.turnId } : {}) });
+        // detached + busy: the server owns the queue (steer = next tool
+        // boundary, queue = next turn)
+        const q = exec.enqueue(id, {
+          content, disposition: b.mode === 'steer' ? 'steering' : 'followup', principalId,
+          ...(b.clientRequestId !== undefined ? { requestId: b.clientRequestId } : {}),
+          ...(Object.keys(queuedBody).length ? { body: queuedBody } : {}),
+        });
+        return reply.code(202).send({ queued: q });
+      }
+      const attempt = res.attempt;
+      if (detach && exec.pendingQueue(id).length > 0) {
+        // idle send while items are pending: it joins the queue and the
+        // claim-all turn runs everything in order
+        const q = exec.enqueue(id, {
+          content, disposition: 'followup', principalId,
+          ...(b.clientRequestId !== undefined ? { requestId: b.clientRequestId } : {}),
+          ...(Object.keys(queuedBody).length ? { body: queuedBody } : {}),
+        });
+        const claimed = admitClaimAll(attempt, id, principalId);
+        if (!claimed) return reply.code(202).send({ queued: q });
+        launchDetached({ id, b: claimed.body, content: claimed.content, session, ownedAttempt: attempt, ac: attempt.controller, durableTurnId: attempt.turnId });
+        return reply.code(202).send({ startedTurnId: attempt.turnId, queued: q });
+      }
+      const adm = exec.admit(attempt, { content, principalId, ...(b.clientRequestId !== undefined ? { requestId: b.clientRequestId } : {}) });
+      if (adm.status !== 'admitted') {
+        if (adm.code === 'REQUEST_ALREADY_ADMITTED') return reply.code(409).send({ error: 'request already admitted', code: adm.code, ...(adm.turnId !== undefined ? { turnId: adm.turnId } : {}) });
+        if (adm.code === 'REQUEST_ID_REUSE') return reply.code(409).send({ error: 'client request id was already used with different content', code: adm.code });
+        if (adm.code === 'SESSION_ACTIVE') return reply.code(409).send({ error: 'turn already in flight on this session', code: adm.code });
+        if (adm.code === 'QUEUE_DECISION') return reply.code(409).send({ error: 'session is resolving prior work — resend to run as the next turn', code: adm.code });
+        return reply.code(500).send({ error: `admission failed: ${adm.message ?? adm.code}`, code: adm.code });
+      }
+      if (detach) {
+        launchDetached({ id, b, content, session, ownedAttempt: attempt, ac: attempt.controller, durableTurnId: attempt.turnId });
+        return reply.code(202).send({ startedTurnId: attempt.turnId });
+      }
+      const r = await runAdmittedTurn({ id, b, content, session, ownedAttempt: attempt, ac: attempt.controller, durableTurnId: attempt.turnId, detached: false, reply });
+      // U3: a held turn also hands off to the queue — after the envelope is built
+      setImmediate(() => { void drainSession(id); });
+      return reply.code(r.code).send(r.payload);
+    }
+    if (activeTurns.has(id)) return reply.code(409).send({ error: 'turn already in flight on this session' });
+    const ac = new AbortController();
+    activeTurns.set(id, ac);
+    const r = await runAdmittedTurn({ id, b, content, session, ownedAttempt: null, ac, durableTurnId: `t_${crypto.randomUUID().slice(0, 12)}`, detached: false, reply });
+    return reply.code(r.code).send(r.payload);
   });
 }
 
