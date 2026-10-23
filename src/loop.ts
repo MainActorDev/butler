@@ -196,6 +196,19 @@ export async function runLoop(systemPrompt: string, userMessage: string, deps: L
     // aborted; ordinary success passes untouched.
     if (deps.signal?.aborted) throw new LoopError('aborted by caller', 'ABORTED', messages, 'caller-abort');
 
+    // A non-streaming provider returns narration beside its tool calls as
+    // message content only — no deltas, so it never reached the delta/block
+    // rail and replayed logs lost it. Emit it as ONE delta, exactly what a
+    // streaming provider would have sent. Final answers (no tool calls) are
+    // left alone: their text rides the turn's answer.
+    const narration = res.message.content ?? '';
+    if (streamedText === '' && (res.message.tool_calls?.length ?? 0) > 0 && narration.trim() !== '') {
+      streamedText = narration;
+      const bid = tracker?.onDelta(hop, narration);
+      deps.onDelta?.(narration);
+      deps.onEvent?.({ type: 'turn.delta', hop, detail: { delta: narration, ...(bid !== undefined ? { blockId: bid } : {}) } });
+    }
+
     // F2: close the hop's text block BEFORE the message lands. text.end prefers
     // the STREAMED accumulation when any deltas flowed (byte-exact to what the
     // UI saw); content is the fallback for snapshot-only hops (which usually

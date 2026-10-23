@@ -1,4 +1,4 @@
-## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget)
+## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget; stop as abort, non-streamed tool narration)
 
 ### Added
 - **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`
@@ -38,6 +38,13 @@
 - Tool events without an invocation id get a per-turn counter id (`tc_<turn>_n<k>`, paired FIFO
   by name) instead of the bare tool name, in the conversation transport and workflow runs.
 - `TurnEventBase.seq` comment: per-session, not per-turn (the schema is `UNIQUE(session_id, seq)`).
+- **A caller Stop is recorded as `turn.aborted {reason}`, not `turn.failed`**: the conversation
+  transport (authority and sink paths) on an explicit abort or client disconnect.
+  `ExecutionAuthority.finalizeOwned` accepts `kind: 'turn.abort'` (+ `reason`). The response
+  envelope (`code: 'ABORTED'`), the ledger settle code and session accounting are unchanged.
+- **Text written beside tool calls by a non-streaming provider is no longer lost**: the loop emits
+  it as one delta (one text block, before the calls), the same shape a streaming provider
+  produces. Streamed hops and final answers are unchanged.
 
 ## [0.8.0] — 2026-10-21 (Stage 3: tree-sitter symbols + watchRoots + structured search)
 

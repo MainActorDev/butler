@@ -144,6 +144,8 @@ describe('authority-driven transport', () => {
       const sess = await rig.storage.getSession(sid);
       expect(sess?.status).toBe('error');
       expect(rig.auth.readSession(sid)).toMatchObject({ state: 'idle', admission: 'ready' }); // ownership released
+      // a provider failure stays a failure (only a caller Stop is an abort)
+      expect(rig.sink.events(sid).filter((e) => e.kind === 'turn.failed' || e.kind === 'turn.aborted').map((e) => e.kind)).toEqual(['turn.failed']);
     } finally {
       await rig.app.close();
       await rig.auth.drain();
@@ -187,6 +189,10 @@ describe('authority-driven transport', () => {
       expect(body.turn.ok).toBe(false);
       expect(body.turn.code).toBe('ABORTED');
       expect(rig.auth.readSession(sid)).toMatchObject({ state: 'idle', admission: 'ready' });
+      // a Stop is recorded as an abort, not a failure — readers show "stopped"
+      const terminals = rig.sink.events(sid).filter((e) => e.kind === 'turn.completed' || e.kind === 'turn.failed' || e.kind === 'turn.aborted');
+      expect(terminals.map((e) => [e.kind, e.detail])).toEqual([['turn.aborted', { reason: 'aborted by caller' }]]);
+      expect(rig.sink.state(sid).activeTurnId).toBeNull();
     } finally {
       await rig.app.close();
       await rig.auth.drain();

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import net from 'node:net';
 import Fastify from 'fastify';
+import Database from 'better-sqlite3';
 import { SqliteStorage } from '../src/memory/sqlite.ts';
+import { EventSink } from '../src/orchestrate/event-sink.ts';
 import { MockProvider } from '../src/provider/mock.ts';
 import { ToolRegistry } from '../src/tools.ts';
 import { registerConversationApi } from '../src/transport/conversation.ts';
@@ -46,6 +48,32 @@ describe('abort mid-flight', () => {
     expect(msgs.some((m) => m.role === 'user' && m.content === 'hang please')).toBe(true);
     await app.close();
     storage.close();
+  });
+
+  it('durable log (sink, no authority): a Stop records turn.aborted, never turn.failed', async () => {
+    const storage = new SqliteStorage(':memory:');
+    const sink = new EventSink(storage['db'] as InstanceType<typeof Database>, { passive: true, enqueueRunTurn: false });
+    const app = Fastify();
+    await registerConversationApi(app, {
+      storage, provider: new MockProvider([{ kind: 'hang', ms: 30_000 }]), registry: new ToolRegistry(), policy: { name: 'draft', allows: 'draft' },
+      systemPrompt: 'sys', budget: { wallMs: 60_000 }, emit: () => undefined, sink,
+    });
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const baseUrl = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
+    try {
+      const sid = ((await (await fetch(`${baseUrl}/api/agent/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).json()) as { session: { id: string } }).session.id;
+      const turnPromise = fetch(`${baseUrl}/api/agent/sessions/${sid}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'hang please' }) })
+        .then((r) => r.json() as Promise<{ turn: { ok: boolean; code?: string } }>);
+      await new Promise((r) => setTimeout(r, 300));
+      await fetch(`${baseUrl}/api/agent/sessions/${sid}/abort`, { method: 'POST' });
+      expect((await turnPromise).turn.code).toBe('ABORTED');
+      const terminals = sink.events(sid).filter((e) => e.kind === 'turn.completed' || e.kind === 'turn.failed' || e.kind === 'turn.aborted');
+      expect(terminals.map((e) => [e.kind, e.detail])).toEqual([['turn.aborted', { reason: 'aborted by caller' }]]);
+      expect((await storage.getSession(sid))?.status).toBe('error'); // accounting unchanged: ABORTED still poisons
+    } finally {
+      await app.close();
+      storage.close();
+    }
   });
 });
 

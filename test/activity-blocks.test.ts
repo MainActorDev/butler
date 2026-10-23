@@ -166,6 +166,43 @@ describe('text block lifecycle durability (F2)', () => {
     }
   });
 
+  it('a non-streamed hop: text written beside tool calls lands as ONE block before the call; the final answer stays block-less', async () => {
+    const provider = new StreamingProvider([
+      { content: 'Looking at the probe first.', toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"x"}' } }] }, // no deltas
+      { content: 'done' }, // no deltas: rides the turn answer only
+    ]);
+    const rig = await boot(provider);
+    try {
+      const sid = await runTurn(rig, 'run probe');
+      const chunks = chunkEvents(rig.sink, sid);
+      expect(chunks.map((c) => c.detail.block?.phase)).toEqual(['start', 'delta', 'end']);
+      expect(chunks.map((c) => c.detail.delta).join('')).toBe('Looking at the probe first.'); // scalar rail carries it once
+      expect(chunks[2]!.detail.block!.text).toBe('Looking at the probe first.');
+      expect(new Set(chunks.map((c) => c.detail.block!.id)).size).toBe(1);
+      // order: the narration precedes the tool call it introduces
+      const kinds = rig.sink.events(sid).map((e) => e.kind).filter((k) => k === 'chunk' || k === 'tool_call');
+      expect(kinds).toEqual(['chunk', 'chunk', 'chunk', 'tool_call']);
+    } finally {
+      await rig.app.close();
+      rig.storage.close();
+    }
+  });
+
+  it('a streamed hop with tool calls is not duplicated by the snapshot', async () => {
+    const provider = new StreamingProvider([
+      { deltas: ['Let me ', 'check.'], content: 'Let me check.', toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"x"}' } }] },
+      { content: 'done' },
+    ]);
+    const rig = await boot(provider);
+    try {
+      const sid = await runTurn(rig, 'run probe');
+      expect(chunkEvents(rig.sink, sid).map((c) => c.detail.delta).join('')).toBe('Let me check.');
+    } finally {
+      await rig.app.close();
+      rig.storage.close();
+    }
+  });
+
   it('a hop with no deltas emits no block', async () => {
     const provider = new StreamingProvider([
       { toolCalls: [{ id: 'c1', type: 'function', function: { name: 'probe', arguments: '{"q":"silent"}' } }] }, // no deltas

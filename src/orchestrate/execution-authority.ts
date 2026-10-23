@@ -333,9 +333,11 @@ export class ExecutionAuthority {
   async finalizeOwned(
     attempt: ExecutionAttempt,
     input: {
-      kind: 'turn.complete' | 'turn.fail';
+      kind: 'turn.complete' | 'turn.fail' | 'turn.abort';
       answer?: string;
       error?: string;
+      /** turn.abort only: the recorded reason (e.g. a caller Stop) */
+      reason?: string;
       commandKey: string;
       settleCode: string;
       accounting?: { status?: 'active' | 'ended' | 'error'; tokensInDelta?: number; tokensOutDelta?: number };
@@ -351,9 +353,11 @@ export class ExecutionAuthority {
         if (!auth || auth.epoch !== this.epoch) throw new Error('stale authority epoch');
         const cmd: TurnCommand = (input.kind === 'turn.complete'
           ? { kind: 'turn.complete', sessionId: attempt.sessionId, turnId: attempt.turnId, answer: input.answer ?? '' }
-          : { kind: 'turn.fail', sessionId: attempt.sessionId, turnId: attempt.turnId, error: input.error ?? 'turn failed' }) as TurnCommand;
+          : input.kind === 'turn.abort'
+            ? { kind: 'turn.abort', sessionId: attempt.sessionId, turnId: attempt.turnId, reason: input.reason ?? 'aborted' }
+            : { kind: 'turn.fail', sessionId: attempt.sessionId, turnId: attempt.turnId, error: input.error ?? 'turn failed' }) as TurnCommand;
         const { events } = this.sink.handleInTransaction(attempt.sessionId, cmd, input.commandKey, undefined);
-        wroteTerminal = events.some((e) => e.kind === 'turn.completed' || e.kind === 'turn.failed');
+        wroteTerminal = events.some((e) => e.kind === 'turn.completed' || e.kind === 'turn.failed' || e.kind === 'turn.aborted');
         if (input.stash) this.storage.stashPartialSync?.(attempt.sessionId, attempt.turnId, input.stash.json);
         if (input.accounting) {
           this.storage.applyAccountingSync?.(attempt.sessionId, input.accounting);
