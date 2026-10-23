@@ -541,6 +541,10 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         outcome.error = e.message ?? String(err);
       }
       outcome.code = e.code ?? undefined;
+      // an explicit Stop (or client disconnect) is recorded as turn.aborted,
+      // not turn.failed — readers tell "stopped" from "broke". The envelope
+      // and session accounting are unchanged (ABORTED keeps poisoning).
+      const callerAbort = err instanceof LoopError && err.cause === 'caller-abort';
       if (exec && ownedAttempt) {
         // §3.5 owned ATOMIC finalization: terminal event + budget stash +
         // session accounting + ledger settle in ONE commit. A storage failure
@@ -548,7 +552,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         // outcome-pending — never a false success.
         try {
           const fin = await finalize(ownedAttempt, {
-            kind: 'turn.fail',
+            ...(callerAbort ? { kind: 'turn.abort' as const, reason: outcome.error } : { kind: 'turn.fail' as const }),
             error: outcome.error,
             commandKey: `chat:${durableTurnId}:fail`,
             settleCode: budgetExhausted ? 'BUDGET_EXCEEDED' : (e.code ?? 'FAILED'),
@@ -561,7 +565,11 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
           return { code: 503, payload: { error: `finalization storage failure — outcome pending, the turn stays reserved for idempotent retry: ${finErr instanceof Error ? finErr.message : String(finErr)}`, code: 'FINALIZATION_PENDING' } };
         }
       } else {
-        if (deps.sink || exec) durable({ kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error } as TurnCommand, `chat:${durableTurnId}:fail`);
+        if (deps.sink || exec) {
+          durable((callerAbort
+            ? { kind: 'turn.abort', sessionId: id, turnId: durableTurnId, reason: outcome.error }
+            : { kind: 'turn.fail', sessionId: id, turnId: durableTurnId, error: outcome.error }) as TurnCommand, `chat:${durableTurnId}:fail`);
+        }
         await storage.updateSession(id, { status: budgetExhausted ? 'active' : 'error' });
         await releaseOwnership(budgetExhausted ? 'BUDGET_EXCEEDED' : (e.code ?? 'FAILED'));
       }
