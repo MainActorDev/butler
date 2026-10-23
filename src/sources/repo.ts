@@ -20,6 +20,11 @@ export interface RepoSourceConfig {
   /** max file bytes read per file (skip monsters) */
   maxFileBytes?: number;
   maxFiles?: number;
+  /** chunk budget for ingest() (default MAX_CHUNKS_PER_SOURCE = 10,000).
+   *  Symbol docs carry one chunk per symbol, so a mid-size repo can pass the
+   *  default — the walk is alphabetical, so the overflow silently drops the
+   *  LATER top-level directories (they land in `skipped`). */
+  maxChunks?: number;
   /** include the tree doc (default true) */
   treeDoc?: boolean;
   /** emit a per-symbol-chunks doc per file (plan Stage G). With
@@ -106,6 +111,7 @@ export function repoConnector(sourceId: string, cfg: RepoSourceConfig): SourceCo
   return {
     kind: 'repo',
     sourceId,
+    ...(cfg.maxChunks !== undefined ? { maxChunks: cfg.maxChunks } : {}),
     async fetch() {
       let root = cfg.origin;
       let tmpClone: string | null = null;
