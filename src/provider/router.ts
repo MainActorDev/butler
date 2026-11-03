@@ -35,6 +35,8 @@ export interface ModelDef {
   priority: number;          // lower = preferred (liorouter)
   enabled: boolean;
   maxOutputTokens?: number;
+  /** per-call time cap in ms (positive integer); absent = the provider default (http 120 s, claude-cli 600 s) */
+  timeoutMs?: number;
   claude?: { binPath?: string; mcpConfigPath?: string };
 }
 
@@ -63,6 +65,7 @@ export interface ModelDefV1 {
   priority: number;
   enabled: boolean;
   maxOutputTokens?: number;
+  timeoutMs?: number;
   claude?: { binPath?: string; mcpConfigPath?: string };
 }
 
@@ -171,6 +174,7 @@ function validateV2(reg: Registry): Registry {
   for (const m of reg.models) {
     if (!m.id || !m.model || typeof m.priority !== 'number') throw new ProviderError(`bad model def: ${JSON.stringify(m).slice(0, 80)}`, 'PROVIDER_BAD_REQUEST');
     if (!pids.has(m.provider)) throw new ProviderError(`model ${m.id} references unknown provider ${m.provider}`, 'PROVIDER_BAD_REQUEST');
+    if (m.timeoutMs !== undefined && !(Number.isInteger(m.timeoutMs) && m.timeoutMs > 0)) throw new ProviderError(`model ${m.id}: timeoutMs must be a positive integer`, 'PROVIDER_BAD_REQUEST');
   }
   for (const c of reg.combos) {
     if (!c.id || !Array.isArray(c.members) || c.members.length === 0) throw new ProviderError(`bad combo: ${c.id}`, 'PROVIDER_BAD_REQUEST');
@@ -295,11 +299,11 @@ export class ModelRouter implements Provider {
     switch (prov.kind) {
       case 'openai':
         if (!prov.baseUrl || !apiKey) throw new ProviderError(`model ${def.id} (provider ${prov.id}): missing baseUrl or ${prov.apiKeyEnv}`, 'PROVIDER_BAD_REQUEST');
-        p = new OpenAICompatProvider({ baseUrl: prov.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
+        p = new OpenAICompatProvider({ baseUrl: prov.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}), ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
         break;
       case 'anthropic':
         if (!prov.baseUrl || !apiKey) throw new ProviderError(`model ${def.id} (provider ${prov.id}): missing baseUrl or ${prov.apiKeyEnv}`, 'PROVIDER_BAD_REQUEST');
-        p = new AnthropicProvider({ baseUrl: prov.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
+        p = new AnthropicProvider({ baseUrl: prov.baseUrl, apiKey, model: def.model, ...(def.maxOutputTokens ? { maxTokens: def.maxOutputTokens } : {}), ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}) }, this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {});
         break;
       case 'claude-cli':
         p = claudeCliProvider({
@@ -307,6 +311,7 @@ export class ModelRouter implements Provider {
           baseUrl: prov.baseUrl ?? '',
           apiKey: apiKey ?? '',
           model: def.model,
+          ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}),
           ...(def.claude?.binPath ? { binPath: def.claude.binPath } : {}),
           ...(def.claude?.mcpConfigPath ? { mcpConfigPath: def.claude.mcpConfigPath } : {}),
           ...(this.opts.claudeEnv?.(def) ? { env: this.opts.claudeEnv!(def) } : {}),
