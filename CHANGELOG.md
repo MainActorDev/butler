@@ -1,4 +1,4 @@
-## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget; stop as abort, non-streamed tool narration)
+## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget; stop as abort, non-streamed tool narration; per-model call timeout)
 
 ### Added
 - **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`
@@ -45,6 +45,11 @@
 - **Text written beside tool calls by a non-streaming provider is no longer lost**: the loop emits
   it as one delta (one text block, before the calls), the same shape a streaming provider
   produces. Streamed hops and final answers are unchanged.
+- **Routed calls honour a per-model timeout**: `ModelDef.timeoutMs` (positive integer, ms) is
+  passed to the provider `ModelRouter` builds (openai-compat, anthropic, claude-cli). Before, a
+  routed call was always cut at the provider default (http 120 s) while the single-provider path
+  could be configured. Absent = the default, unchanged. `parseRegistry` rejects 0, negatives and
+  non-integers.
 
 ## [0.8.0] — 2026-10-21 (Stage 3: tree-sitter symbols + watchRoots + structured search)
 
