@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractSymbolsTree, symbolsFor, defaultSymbolGrammars, prepareGrammars, symbolChunksFor } from '../src/sources/tree-sitter.ts';
+import { extractSymbolsTree, symbolsFor, defaultSymbolGrammars, prepareGrammars, symbolChunksFor, queryMatches } from '../src/sources/tree-sitter.ts';
 import { repoDocumentFor } from '../src/sources/repo.ts';
 import { SqliteStorage } from '../src/memory/sqlite.ts';
 import { ingest } from '../src/sources/connector.ts';
@@ -139,5 +139,99 @@ describe('ingest chunks passthrough (F1)', () => {
     await storage.close?.();
     rmSync(dir, { recursive: true, force: true });
     rmSync(repoDir, { recursive: true, force: true });
+  });
+});
+
+/** ranges, parents, Go, caller queries: what a consumer needs to cut one chunk
+ *  per symbol with exact lines and run its own extraction queries. */
+const TS_RANGES = `export class BoardPage {
+  readonly menu: string;
+
+  constructor() {
+    this.menu = 'x';
+  }
+
+  async openMenu(): Promise<void> {
+    await go();
+  }
+}
+
+export async function createShipment(
+  deps: Deps,
+): Promise<void> {
+  return;
+}
+
+export const tabs = [
+  { name: 'a', title: 'Belum Dijemput' },
+];
+`;
+
+const GO = `package main
+
+type Handler struct {
+  svc Service
+}
+
+type Service interface {
+  Do() error
+}
+
+type ID string
+
+func (h *Handler) Transfer(c echo.Context) error {
+  return nil
+}
+
+func Register(e *echo.Echo, h *Handler) {
+  g := e.Group("/v1/dashboard-pickup")
+  g.POST("/transfer", h.Transfer)
+  g.Use(mw)
+}
+`;
+
+describe('symbol ranges, parents, Go and caller queries', () => {
+  const g = { ...defaultSymbolGrammars(), go: 'go' };
+
+  it('typescript: endLine is the last line of the declaration; methods name their class', async () => {
+    const syms = await extractSymbolsTree(TS_RANGES, 'p.ts', g);
+    const by = (n: string) => syms.find((s) => s.name === n)!;
+    expect(by('BoardPage')).toMatchObject({ kind: 'class', line: 1, endLine: 11 });
+    expect(by('BoardPage').parent).toBeUndefined();
+    expect(by('constructor')).toMatchObject({ kind: 'method', line: 4, endLine: 6, parent: 'BoardPage' });
+    expect(by('openMenu')).toMatchObject({ kind: 'method', line: 8, endLine: 10, parent: 'BoardPage' });
+    expect(by('createShipment')).toMatchObject({ kind: 'function', line: 13, endLine: 17 });
+    expect(by('tabs')).toMatchObject({ kind: 'const', line: 19, endLine: 21 });
+  });
+
+  it('go: struct/interface/type, functions, methods with their receiver as parent', async () => {
+    const syms = await extractSymbolsTree(GO, 'h.go', g);
+    const got = syms.map((s) => `${s.name}:${s.kind}:${s.line}-${s.endLine}:${s.parent ?? ''}`);
+    expect(got).toEqual(['Handler:struct:3-5:', 'Service:interface:7-9:', 'ID:type:11-11:', 'Transfer:method:13-15:Handler', 'Register:function:17-21:']);
+  });
+
+  it('go is not in the shipped default map: no grammar, no symbols (callers opt in)', async () => {
+    expect(defaultSymbolGrammars()['go']).toBeUndefined();
+    expect(await symbolsFor(GO, 'h.go', defaultSymbolGrammars())).toEqual([]);
+  });
+
+  it('the regex fallback keeps its shape (no endLine/parent it cannot know)', async () => {
+    const syms = await symbolsFor('export function f() {}\n', 'a.ts', {});
+    expect(syms).toEqual([{ name: 'f', kind: 'function', line: 1 }]);
+  });
+
+  it('queryMatches: one entry per match, captures together, predicates applied', async () => {
+    const q = `(call_expression
+      function: (selector_expression field: (field_identifier) @verb (#match? @verb "^(GET|POST|PUT|PATCH|DELETE)$"))
+      arguments: (argument_list . (interpreted_string_literal) @path))`;
+    const m = await queryMatches(GO, 'h.go', g, q);
+    expect(m).toEqual([[{ name: 'verb', text: 'POST', line: 19, endLine: 19 }, { name: 'path', text: '"/transfer"', line: 19, endLine: 19 }]]);
+    const pairs = await queryMatches(TS_RANGES, 'p.ts', g, `(pair key: (property_identifier) @k (#eq? @k "title") value: (string (string_fragment) @v))`);
+    expect(pairs).toEqual([[{ name: 'k', text: 'title', line: 20, endLine: 20 }, { name: 'v', text: 'Belum Dijemput', line: 20, endLine: 20 }]]);
+  });
+
+  it('queryMatches returns null when there is no grammar or the query does not compile', async () => {
+    expect(await queryMatches(GO, 'h.rs', g, '(identifier) @x')).toBeNull();
+    expect(await queryMatches(GO, 'h.go', g, '(no_such_node) @x')).toBeNull();
   });
 });

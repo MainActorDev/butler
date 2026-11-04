@@ -1,6 +1,21 @@
 ## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget; stop as abort, non-streamed tool narration; per-model call timeout)
 
 ### Added
+- **Symbol ranges and parents** (`sources/tree-sitter.ts`) — tree-sitter symbols carry
+  `endLine` (last line of the declaration) and `parent` (enclosing class/interface/struct, or a
+  Go method's receiver type), so a consumer can cut one chunk per symbol with exact lines. Both
+  are optional: the regex fallback leaves them unset. Repo symbol docs are byte-identical.
+- **Go symbols** — `function_declaration`, `method_declaration`, `type_spec` (refined to
+  `struct` / `interface` / `type`). Opt-in: `go` is not added to `defaultSymbolGrammars()`;
+  pass `{ go: 'go' }` (pack grammar).
+- **`queryMatches(source, filePath, grammars, query)`** — runs a caller-supplied tree-sitter
+  query with the grammar configured for the file's extension; one entry per match with its
+  captures (`name, text, line, endLine`), `#eq?` / `#match?` applied. `null` when there is no
+  grammar or the query does not compile. Compiled queries are cached per grammar.
+
+### Fixed
+- `extractSymbolsTree` now frees each parse tree and parser (WASM memory on large repos).
+
 - **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`
   (requires an execution authority; else `400 DETACH_UNSUPPORTED`) answers at once:
   `202 {startedTurnId}` when idle, `202 {queued: {queueId, disposition}}` when busy
