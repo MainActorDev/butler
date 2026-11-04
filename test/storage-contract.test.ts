@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { SqliteStorage } from '../src/memory/sqlite.ts';
 import type { Storage } from '../src/memory/contract.ts';
 
@@ -34,6 +35,21 @@ function contractSuite(name: string, make: () => Promise<Storage>, skip?: boolea
       const all = await s.sessionMessages('m1');
       expect(all[3]!.tool_calls_json).toContain('"c"');
       expect(all[3]!.tokens_in).toBe(7);
+    });
+
+    it('messages: appends within the same millisecond keep insert order', async () => {
+      const s = await make();
+      await s.createSession({ id: 'm-tie' });
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+      try {
+        for (let i = 0; i < 20; i++) {
+          await s.appendMessage({ session_id: 'm-tie', role: i % 2 ? 'tool' : 'assistant', content: `m${i}`, tool_calls_json: null, tool_results_json: null, tokens_in: 0, tokens_out: 0 });
+        }
+      } finally {
+        clock.mockRestore();
+      }
+      const msgs = await s.sessionMessages('m-tie');
+      expect(msgs.map((m) => m.content)).toEqual(Array.from({ length: 20 }, (_, i) => `m${i}`));
     });
 
     it('notes: provenance mandatory; supersession audits; activeNotes filters', async () => {
@@ -101,12 +117,36 @@ contractSuite('sqlite', async () => SqliteStorage.memory(), false);
 // postgres leg — only with BUTLER_TEST_PG (plan F open item: default skip-honestly)
 const PG = process.env['BUTLER_TEST_PG'];
 if (PG) {
+  // Each case gets a fresh schema of its own, migrated, so fixed ids never collide across cases or re-runs;
+  // the schemas are dropped after the suite.
+  const opened: { storage: { close(): Promise<void> }; schema: string }[] = [];
+  afterAll(async () => {
+    const { Pool } = await import('pg');
+    const admin = new Pool({ connectionString: PG });
+    try {
+      for (const { storage, schema } of opened.splice(0)) {
+        await storage.close();
+        await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      }
+    } finally {
+      await admin.end();
+    }
+  });
   contractSuite('postgres', async () => {
+    const { Pool } = await import('pg');
     const { PostgresStorage } = await import('../src/memory/postgres.ts');
-    const suffix = Math.random().toString(36).slice(2, 8);
-    const s = new PostgresStorage(PG);
-    // fresh ids per run so legs are order-independent (no destructive cleanup in shared DBs)
-    (s as unknown as { _idsuffix?: string })._idsuffix = suffix;
+    const schema = `butler_contract_${randomBytes(4).toString('hex')}`;
+    const admin = new Pool({ connectionString: PG });
+    try {
+      await admin.query(`CREATE SCHEMA ${schema}`);
+    } finally {
+      await admin.end();
+    }
+    const url = new URL(PG);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    const s = new PostgresStorage(url.toString());
+    opened.push({ storage: s, schema });
+    await s.migrate();
     return s;
   }, false);
 } else {
