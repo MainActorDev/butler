@@ -50,6 +50,12 @@
   routed call was always cut at the provider default (http 120 s) while the single-provider path
   could be configured. Absent = the default, unchanged. `parseRegistry` rejects 0, negatives and
   non-integers.
+- **Postgres: messages appended in the same millisecond come back in insert order**:
+  `sessionMessages` broke `created_at` ties by the random message id, so a tool call and its result
+  could swap. `butler_messages` gains `seq` (identity; `migrate()` adds and backfills it on an
+  existing table) and reads order by `created_at, seq`, the same order the sqlite driver's rowid
+  gives. The postgres contract leg (`BUTLER_TEST_PG`) now migrates a fresh schema per case; it had
+  never created its tables.
 
 ## [0.8.0] — 2026-10-21 (Stage 3: tree-sitter symbols + watchRoots + structured search)
 
