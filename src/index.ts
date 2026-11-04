@@ -41,8 +41,8 @@ export type { McpMountOpts } from './transport/mcp.ts';
 
 // Roadmap stage G → Stage-3 v2 — symbol chunks (tree-sitter WASM; repo
 // sources opt in with a grammar map, regex fallback without)
-export { extractSymbols, extractSymbolsTree, symbolsFor, symbolChunksFor, prepareGrammars, defaultSymbolGrammars } from './sources/tree-sitter.ts';
-export type { SymbolInfo, SymbolChunk, SymbolGrammars } from './sources/tree-sitter.ts';
+export { extractSymbols, extractSymbolsTree, symbolsFor, symbolChunksFor, prepareGrammars, defaultSymbolGrammars, queryMatches } from './sources/tree-sitter.ts';
+export type { SymbolInfo, SymbolChunk, SymbolGrammars, QueryCapture } from './sources/tree-sitter.ts';
 
 // Stage 3 — watchRoots mechanism (freshness; policy lives with the consumer)
 export { watchRoots } from './watch.ts';

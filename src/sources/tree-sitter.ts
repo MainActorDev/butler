@@ -11,12 +11,18 @@
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Parser, Language, Node as TsNode } from 'web-tree-sitter';
+import { Parser, Language, Query, Node as TsNode } from 'web-tree-sitter';
 
 export interface SymbolInfo {
   name: string;
   kind: 'function' | 'class' | 'interface' | 'type' | 'method' | 'const' | 'struct' | 'protocol' | 'enum';
   line: number;
+  /** last line of the declaration (1-based, inclusive). Set by the
+   *  tree-sitter path only; the v1 regex fallback cannot know it. */
+  endLine?: number;
+  /** enclosing class/interface/struct for methods and members (tree-sitter
+   *  path only), or the receiver type of a Go method. */
+  parent?: string;
 }
 
 /** caller policy: file extension → grammar. Value is either a grammar name
@@ -110,7 +116,22 @@ const NODE_KINDS: Record<string, Record<string, SymbolInfo['kind']>> = {
     function_definition: 'function',
     class_definition: 'class',
   },
+  // type_spec is refined to struct/interface by its type child (below)
+  go: {
+    function_declaration: 'function',
+    method_declaration: 'method',
+    type_spec: 'type',
+  },
 };
+
+/** node types whose name becomes `parent` for the symbols nested inside */
+const CONTAINERS = new Set(['class_declaration', 'abstract_class_declaration', 'interface_declaration', 'class_definition', 'struct_declaration', 'protocol_declaration', 'enum_declaration']);
+
+/** Go method receiver type: `(h *Handler)` → Handler, `(s Svc[T])` → Svc */
+function goReceiver(node: TsNode): string | undefined {
+  const text = node.childForFieldName('receiver')?.text ?? '';
+  return /\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)/.exec(text)?.[1];
+}
 
 /** Tree-sitter symbols for one file. Returns [] when no grammar is configured
  *  for the extension or the grammar fails to load — the caller falls back. */
@@ -128,7 +149,8 @@ export async function extractSymbolsTree(source: string, filePath: string, gramm
   parser.setLanguage(lang);
   const tree = parser.parse(source);
   const out: SymbolInfo[] = [];
-  const visit = (node: TsNode): void => {
+  const endOf = (n: TsNode) => n.endPosition.row + 1;
+  const visit = (node: TsNode, parent: string | undefined): void => {
     let kind = kinds[node.type];
     if (kind) {
       // swift models struct/class/extension all as class_declaration — the
@@ -144,20 +166,78 @@ export async function extractSymbolsTree(source: string, filePath: string, gramm
           const d = node.child(i)!;
           if (d.type === 'variable_declarator') {
             const dn = d.childForFieldName('name')?.text?.trim();
-            if (dn) out.push({ name: dn, kind: 'const', line: (d.startPosition.row) + 1 });
+            if (dn) out.push({ name: dn, kind: 'const', line: (d.startPosition.row) + 1, endLine: endOf(d), ...(parent ? { parent } : {}) });
           }
         }
         kind = undefined; // handled per-declarator above
       }
+      // go: `type X struct{…}` / `type X interface{…}` / `type X string`
+      if (family === 'go' && node.type === 'type_spec') {
+        const t = node.childForFieldName('type')?.type;
+        kind = t === 'struct_type' ? 'struct' : t === 'interface_type' ? 'interface' : 'type';
+      }
       // these grammars expose the declared identifier as the `name` field
       const nameNode = node.childForFieldName('name');
       const name = nameNode?.text?.trim();
-      if (kind && name) out.push({ name, kind, line: (nameNode?.startPosition.row ?? node.startPosition.row) + 1 });
+      const owner = family === 'go' && node.type === 'method_declaration' ? goReceiver(node) : parent;
+      if (kind && name) out.push({ name, kind, line: (nameNode?.startPosition.row ?? node.startPosition.row) + 1, endLine: endOf(node), ...(owner ? { parent: owner } : {}) });
     }
-    for (let i = 0; i < node.childCount; i++) visit(node.child(i)!);
+    const inner = CONTAINERS.has(node.type) ? (node.childForFieldName('name')?.text?.trim() || parent) : parent;
+    for (let i = 0; i < node.childCount; i++) visit(node.child(i)!, inner);
   }
-  if (tree) visit(tree.rootNode);
+  try {
+    if (tree) visit(tree.rootNode, undefined);
+  } finally {
+    tree?.delete(); // WASM memory: one tree + parser per file adds up on large repos
+    parser.delete();
+  }
   return out;
+}
+
+export interface QueryCapture {
+  name: string;   // capture name without the `@`
+  text: string;
+  line: number;    // 1-based start line
+  endLine: number; // 1-based end line, inclusive
+}
+
+const queryCache = new Map<string, Query | null>();
+
+/** Run a caller-supplied tree-sitter query (S-expression, with `#eq?` /
+ *  `#match?` predicates) over one file with the grammar the caller configured
+ *  for its extension. One entry per match, its captures in pattern order, so
+ *  related captures (a key and its value) stay together. Returns null when no
+ *  grammar is configured, the grammar fails to load, or the query does not
+ *  compile for that grammar; the caller falls back. The query itself is
+ *  caller policy; this is mechanism only. */
+export async function queryMatches(source: string, filePath: string, grammars: SymbolGrammars, query: string): Promise<QueryCapture[][] | null> {
+  const ext = /(?:^|\.)([a-z0-9]+)$/i.exec(filePath)?.[1]?.toLowerCase() ?? '';
+  const value = grammars[ext];
+  if (!value) return null;
+  const { key, src } = wasmSource(value);
+  const lang = await loadGrammar(key, src);
+  if (!lang) return null;
+  const qk = `${key}\u0000${query}`;
+  if (!queryCache.has(qk)) {
+    try {
+      queryCache.set(qk, new Query(lang, query));
+    } catch {
+      queryCache.set(qk, null);
+    }
+  }
+  const q = queryCache.get(qk);
+  if (!q) return null;
+  await loadParser();
+  const parser = new Parser();
+  parser.setLanguage(lang);
+  const tree = parser.parse(source);
+  try {
+    if (!tree) return null;
+    return q.matches(tree.rootNode).map((m) => m.captures.map((c) => ({ name: c.name, text: c.node.text, line: c.node.startPosition.row + 1, endLine: c.node.endPosition.row + 1 })));
+  } finally {
+    tree?.delete();
+    parser.delete();
+  }
 }
 
 /** v1 structural symbol scan for TS/JS-family sources. Honest scope: regex
