@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS butler_messages(
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS butler_messages_session ON butler_messages(session_id, created_at);
+-- Insert order (the sqlite driver's rowid): breaks created_at ties between messages appended in the same ms.
+ALTER TABLE butler_messages ADD COLUMN IF NOT EXISTS seq BIGINT GENERATED ALWAYS AS IDENTITY;
 
 CREATE TABLE IF NOT EXISTS butler_notes(
   id TEXT PRIMARY KEY,
@@ -188,8 +190,8 @@ export class PostgresStorage implements Storage {
   async appendMessage(m: Omit<MessageRow, 'id' | 'created_at'>): Promise<MessageRow> {
     const id = `msg_${randomUUID().slice(0, 12)}`;
     const created = Date.now();
-    // preserve INSERT order under same-ms: ordinal suffix in id is random; order by created_at may tie.
-    // rows carry a monotonic sequence via created_at + id; retrieval orders by created_at, id (see sessionMessages)
+    // created_at ties when messages land in the same ms; the seq identity column keeps INSERT order
+    // (sessionMessages orders by created_at, seq).
     await this.pool.query(
       'INSERT INTO butler_messages(id, session_id, role, content, tool_calls_json, tool_results_json, tokens_in, tokens_out, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
       [id, m.session_id, m.role, m.content, m.tool_calls_json, m.tool_results_json, m.tokens_in, m.tokens_out, created],
@@ -211,7 +213,7 @@ export class PostgresStorage implements Storage {
   }
 
   async sessionMessages(sessionId: string): Promise<MessageRow[]> {
-    const r = await this.pool.query('SELECT * FROM butler_messages WHERE session_id = $1 ORDER BY created_at ASC, id ASC', [sessionId]);
+    const r = await this.pool.query('SELECT * FROM butler_messages WHERE session_id = $1 ORDER BY created_at ASC, seq ASC', [sessionId]);
     return r.rows.map((x) => ({
       id: String(x['id']), session_id: String(x['session_id']), role: String(x['role']) as MessageRow['role'],
       content: x['content'] === null ? null : String(x['content']),
