@@ -72,6 +72,13 @@ export interface ConversationDeps {
   /** detached turns: waits (ms) between finalization retries when the
    *  terminal write fails (default 1s, 5s, 30s). Tests shorten it. */
   finalizeRetryMs?: number[];
+  /** Steering without an execution authority: the host's own list of messages
+   *  for a running turn. Called at each tool boundary of the turn on
+   *  `sessionId`; whatever it returns joins the turn as user messages (stored
+   *  like any loop message). The host owns the list, its persistence and what
+   *  happens to items still waiting when the turn ends. Ignored when
+   *  `execution` is set (the authority's queue is the steering source). */
+  takeSteering?: (sessionId: string) => Array<{ queueId: string; content: string }>;
 }
 
 export interface TurnOutcome {
@@ -427,7 +434,11 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         // steering seam: queued steers join at each tool boundary; the
         // authority records the delivery (owned, one commit) before handing
         // the items over
-        ...(exec && ownedAttempt ? { takeSteering: () => exec.deliverSteering(ownedAttempt) } : {}),
+        ...(exec && ownedAttempt
+          ? { takeSteering: () => exec.deliverSteering(ownedAttempt) }
+          : !exec && deps.takeSteering
+            ? { takeSteering: () => deps.takeSteering!(id) }
+            : {}),
         onMessage: (msg, meta) => {
           if (!sink) void storage.appendMessage({
             session_id: id, role: msg.role, content: msg.content,
