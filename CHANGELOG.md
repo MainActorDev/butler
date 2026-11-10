@@ -20,6 +20,11 @@
   grammar or the query does not compile. Compiled queries are cached per grammar.
 
 ### Fixed
+- **Loop messages are stored in loop order** (no execution authority, no event sink) — each
+  `appendMessage` now waits for the one before it, and the turn answers only after all of them are
+  written. Before, the writes were fire-and-forget: with a store slower for one row (a networked
+  database), a steer could be written between a tool call and its result, and the next turn's
+  history put a user message inside a tool exchange.
 - `extractSymbolsTree` now frees each parse tree and parser (WASM memory on large repos).
 
 - **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`
