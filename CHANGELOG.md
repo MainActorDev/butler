@@ -1,6 +1,12 @@
 ## [Unreleased] (detached send, server-owned queue, steering, push-on-append; per-source chunk budget; stop as abort, non-streamed tool narration; per-model call timeout)
 
 ### Added
+- **Host-owned steering** (`ConversationDeps.takeSteering(sessionId)`) — a host that runs
+  without an execution authority (e.g. Postgres storage) can steer a running turn: the transport
+  asks it at each tool boundary, and each returned item joins the turn as a user message, stored
+  like any loop message and sent with the next model call. The host owns the list and what happens
+  to items still waiting when the turn ends. Ignored when `execution` is set. A throwing hook is
+  treated as no steers.
 - **Symbol ranges and parents** (`sources/tree-sitter.ts`) — tree-sitter symbols carry
   `endLine` (last line of the declaration) and `parent` (enclosing class/interface/struct, or a
   Go method's receiver type), so a consumer can cut one chunk per symbol with exact lines. Both
@@ -14,6 +20,11 @@
   grammar or the query does not compile. Compiled queries are cached per grammar.
 
 ### Fixed
+- **Loop messages are stored in loop order** (no execution authority, no event sink) — each
+  `appendMessage` now waits for the one before it, and the turn answers only after all of them are
+  written. Before, the writes were fire-and-forget: with a store slower for one row (a networked
+  database), a steer could be written between a tool call and its result, and the next turn's
+  history put a user message inside a tool exchange.
 - `extractSymbolsTree` now frees each parse tree and parser (WASM memory on large repos).
 
 - **Detached send (opt-in)** — `POST /api/agent/sessions/:id/messages` with `detach: true`

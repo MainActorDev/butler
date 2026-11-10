@@ -72,6 +72,13 @@ export interface ConversationDeps {
   /** detached turns: waits (ms) between finalization retries when the
    *  terminal write fails (default 1s, 5s, 30s). Tests shorten it. */
   finalizeRetryMs?: number[];
+  /** Steering without an execution authority: the host's own list of messages
+   *  for a running turn. Called at each tool boundary of the turn on
+   *  `sessionId`; whatever it returns joins the turn as user messages (stored
+   *  like any loop message). The host owns the list, its persistence and what
+   *  happens to items still waiting when the turn ends. Ignored when
+   *  `execution` is set (the authority's queue is the steering source). */
+  takeSteering?: (sessionId: string) => Array<{ queueId: string; content: string }>;
 }
 
 export interface TurnOutcome {
@@ -413,6 +420,7 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         if (t.phase === 'call') { open.push(fresh); openByName.set(t.name, open); }
         return fresh;
       };
+      let saved: Promise<void> = Promise.resolve();
       const loopDeps: Parameters<typeof runLoop>[2] = {
         sessionKey: id, // R2-F4: per-Lionidas-session claude --resume isolation
         // prior turns only — the current message rides as userMessage; a
@@ -427,13 +435,21 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         // steering seam: queued steers join at each tool boundary; the
         // authority records the delivery (owned, one commit) before handing
         // the items over
-        ...(exec && ownedAttempt ? { takeSteering: () => exec.deliverSteering(ownedAttempt) } : {}),
+        ...(exec && ownedAttempt
+          ? { takeSteering: () => exec.deliverSteering(ownedAttempt) }
+          : !exec && deps.takeSteering
+            ? { takeSteering: () => deps.takeSteering!(id) }
+            : {}),
         onMessage: (msg, meta) => {
-          if (!sink) void storage.appendMessage({
+          // stored in the loop's order: each append waits for the one before
+          // it, so a steer handed over right after a tool result can't land
+          // between that result and its tool call (an async store would
+          // otherwise race them, and the next turn's history breaks)
+          if (!sink) saved = saved.then(() => storage.appendMessage({
             session_id: id, role: msg.role, content: msg.content,
             tool_calls_json: msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
             tool_results_json: null, tokens_in: meta.tokensIn, tokens_out: meta.tokensOut,
-          });
+          })).then(() => undefined, () => undefined);
         },
         onTool: (t) => {
           // R3 fix: tool calls are durable entities too — the rail correlates by
@@ -461,9 +477,9 @@ export async function registerConversationApi(app: FastifyInstance, deps: Conver
         },
       };
       const systemPrompt = deps.systemPrompt + cmdBlock + notesBlock + (prep?.promptBlock ?? '') + resumeNote;
-      const result = await (exec && ownedAttempt
+      const result = await Promise.resolve(exec && ownedAttempt
         ? exec.trackWorker({ turnId: durableTurnId, identity: { seam: 'provider' } }, 'provider', () => runLoop(systemPrompt, content, loopDeps)) as unknown as Awaited<ReturnType<typeof runLoop>>
-        : runLoop(systemPrompt, content, loopDeps));
+        : runLoop(systemPrompt, content, loopDeps)).finally(() => saved);
       // v0.5.4: an EMPTY answer after real work is not success. A turn that
       // streamed narration or called tools and still ends with "" burned its
       // context (the 05:46 incident: 1M tokens, 40 tool calls, answer "") —
